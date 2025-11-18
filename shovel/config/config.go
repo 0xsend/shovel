@@ -342,6 +342,7 @@ type Source struct {
 	Concurrency  int
 	BatchSize    int
 	Consensus    Consensus
+	ReceiptVerifier ReceiptVerifier
 }
 
 type Consensus struct {
@@ -349,6 +350,11 @@ type Consensus struct {
 	Threshold    int           `json:"threshold"`
 	RetryBackoff time.Duration `json:"retry_backoff"`
 	MaxBackoff   time.Duration `json:"max_backoff"`
+}
+
+type ReceiptVerifier struct {
+	Provider string `json:"provider"`
+	Enabled  bool   `json:"enabled"`
 }
 
 func (s *Source) UnmarshalJSON(d []byte) error {
@@ -369,6 +375,10 @@ func (s *Source) UnmarshalJSON(d []byte) error {
 			RetryBackoff wos.EnvString `json:"retry_backoff"`
 			MaxBackoff   wos.EnvString `json:"max_backoff"`
 		} `json:"consensus"`
+		ReceiptVerifier struct {
+			Provider wos.EnvString `json:"provider"`
+			Enabled  bool          `json:"enabled"`
+		} `json:"receipt_verifier"`
 	}{}
 	if err := json.Unmarshal(d, &x); err != nil {
 		return err
@@ -382,6 +392,8 @@ func (s *Source) UnmarshalJSON(d []byte) error {
 	s.BatchSize = int(x.BatchSize)
 	s.Consensus.Providers = int(x.Consensus.Providers)
 	s.Consensus.Threshold = int(x.Consensus.Threshold)
+	s.ReceiptVerifier.Provider = string(x.ReceiptVerifier.Provider)
+	s.ReceiptVerifier.Enabled = x.ReceiptVerifier.Enabled
 	if s.Consensus.Providers == 0 {
 		s.Consensus.Providers = 1
 	}

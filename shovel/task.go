@@ -119,6 +119,12 @@ func WithConsensus(ce *ConsensusEngine) Option {
 	}
 }
 
+func WithReceiptValidator(rv *ReceiptValidator) Option {
+	return func(t *Task) {
+		t.receiptValidator = rv
+	}
+}
+
 func NewDestination(ig config.Integration) (Destination, error) {
 	switch {
 	case len(ig.Compiled.Name) > 0:
@@ -190,7 +196,8 @@ type Task struct {
 	srcName    string
 	srcChainID uint64
 
-	consensus *ConsensusEngine
+	consensus        *ConsensusEngine
+	receiptValidator *ReceiptValidator
 
 	dests       []Destination
 	destFactory func(config.Integration) (Destination, error)
@@ -453,12 +460,27 @@ func (task *Task) Converge() error {
 		if err != nil {
 			return fmt.Errorf("starting insert pg tx: %w", err)
 		}
-		nrows, err := task.insert(ctx, pgtx, blocks)
-		if err != nil {
-			pgtx.Rollback(ctx)
-			return fmt.Errorf("inserting data: %w", err)
+	nrows, err := task.insert(ctx, pgtx, blocks)
+	if err != nil {
+		pgtx.Rollback(ctx)
+		return fmt.Errorf("inserting data: %w", err)
+	}
+	if task.receiptValidator != nil && task.receiptValidator.Enabled() {
+		var cHash []byte
+		if len(consensusHash) > 0 {
+			cHash = consensusHash
+		} else {
+			cHash = HashBlocks(blocks)
 		}
 		last := blocks[len(blocks)-1]
+		err := task.receiptValidator.Validate(ctx, last.Num(), cHash)
+		if err != nil {
+			pgtx.Rollback(ctx)
+			slog.ErrorContext(ctx, "receipt-mismatch", "block", last.Num(), "error", err)
+			return fmt.Errorf("validating receipts: %w", err)
+		}
+	}
+	last := blocks[len(blocks)-1]
 		err = task.update(pgtx, last.Num(), last.Hash(), targetNum, targetHash, delta, nrows, time.Since(t0))
 		if err != nil {
 			pgtx.Rollback(ctx)
@@ -870,6 +892,14 @@ func loadTasks(ctx context.Context, pgp *pgxpool.Pool, c config.Root) ([]*Task, 
 					return nil, fmt.Errorf("setting up consensus engine: %w", err)
 				}
 			}
+			var rv *ReceiptValidator
+			if sc.ReceiptVerifier.Enabled {
+				url := sc.ReceiptVerifier.Provider
+				if url == "" && len(sc.URLs) > 0 {
+					url = sc.URLs[len(sc.URLs)-1]
+				}
+				rv = NewReceiptValidator(jrpc2.New(url), true, NewMetrics(sc.Name))
+			}
 			task, err := NewTask(
 				WithContext(ctx),
 				WithPG(pgp),
@@ -881,6 +911,7 @@ func loadTasks(ctx context.Context, pgp *pgxpool.Pool, c config.Root) ([]*Task, 
 				WithSource(src),
 				WithIntegration(ig),
 				WithConsensus(ce),
+				WithReceiptValidator(rv),
 			)
 			if err != nil {
 				return nil, fmt.Errorf("setting up main task: %w", err)
