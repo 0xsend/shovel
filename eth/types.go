@@ -141,10 +141,13 @@ func (b *Block) Tx(idx uint64) *Tx {
 }
 
 type Log struct {
-	Idx     Uint64  `json:"logIndex"`
-	Address Bytes   `json:"address"`
-	Topics  []Bytes `json:"topics"`
-	Data    Bytes   `json:"data"`
+	BlockNumber Uint64  `json:"blockNumber"`
+	TxHash      Bytes   `json:"transactionHash"`
+	Idx         Uint64  `json:"logIndex"`
+	Index       Uint64  `json:"transactionIndex"`
+	Address     Bytes   `json:"address"`
+	Topics      []Bytes `json:"topics"`
+	Data        Bytes   `json:"data"`
 }
 
 type Logs []Log
@@ -157,7 +160,10 @@ func (ls *Logs) Add(other *Log) {
 	}
 
 	l := Log{}
+	l.BlockNumber = other.BlockNumber
+	l.TxHash.Write(other.TxHash)
 	l.Idx = other.Idx
+	l.Index = other.Index
 	l.Address.Write(other.Address)
 	l.Topics = make([]Bytes, len(other.Topics))
 	for i := range other.Topics {
