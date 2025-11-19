@@ -343,6 +343,7 @@ type Source struct {
 	BatchSize    int
 	Consensus    Consensus
 	ReceiptVerifier ReceiptVerifier
+	Audit        Audit
 }
 
 type Consensus struct {
@@ -355,6 +356,13 @@ type Consensus struct {
 type ReceiptVerifier struct {
 	Provider string `json:"provider"`
 	Enabled  bool   `json:"enabled"`
+}
+
+type Audit struct {
+	ProvidersPerBlock int  `json:"providers_per_block"`
+	Confirmations     uint64 `json:"confirmations"`
+	Parallelism       int  `json:"parallelism"`
+	Enabled           bool `json:"enabled"`
 }
 
 func (s *Source) UnmarshalJSON(d []byte) error {
@@ -379,6 +387,12 @@ func (s *Source) UnmarshalJSON(d []byte) error {
 			Provider wos.EnvString `json:"provider"`
 			Enabled  bool          `json:"enabled"`
 		} `json:"receipt_verifier"`
+		Audit struct {
+			ProvidersPerBlock wos.EnvInt    `json:"providers_per_block"`
+			Confirmations     wos.EnvUint64 `json:"confirmations"`
+			Parallelism       wos.EnvInt    `json:"parallelism"`
+			Enabled           bool          `json:"enabled"`
+		} `json:"audit"`
 	}{}
 	if err := json.Unmarshal(d, &x); err != nil {
 		return err
@@ -394,6 +408,10 @@ func (s *Source) UnmarshalJSON(d []byte) error {
 	s.Consensus.Threshold = int(x.Consensus.Threshold)
 	s.ReceiptVerifier.Provider = string(x.ReceiptVerifier.Provider)
 	s.ReceiptVerifier.Enabled = x.ReceiptVerifier.Enabled
+	s.Audit.ProvidersPerBlock = int(x.Audit.ProvidersPerBlock)
+	s.Audit.Confirmations = uint64(x.Audit.Confirmations)
+	s.Audit.Parallelism = int(x.Audit.Parallelism)
+	s.Audit.Enabled = x.Audit.Enabled
 	if s.Consensus.Providers == 0 {
 		s.Consensus.Providers = 1
 	}

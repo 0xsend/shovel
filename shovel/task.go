@@ -756,12 +756,13 @@ func TaskUpdates(ctx context.Context, pg wpg.Conn) ([]TaskUpdate, error) {
 // based on config stored in the DB and in the config file.
 type Manager struct {
 	ctx     context.Context
-	running sync.Mutex
-	restart chan struct{}
-	tasks   []*Task
-	updates chan uint64
 	pgp     *pgxpool.Pool
 	conf    config.Root
+	tasks   []*Task
+	restart chan struct{}
+	updates chan uint64
+	running sync.Mutex
+	auditor *Auditor
 }
 
 func NewManager(ctx context.Context, pgp *pgxpool.Pool, conf config.Root) *Manager {
@@ -834,6 +835,15 @@ func (tm *Manager) Run(ec chan error) {
 		return
 	}
 	close(ec)
+
+	// Start auditor if any source has audit enabled
+	for _, sc := range tm.conf.Sources {
+		if sc.Audit.Enabled {
+			tm.auditor = NewAuditor(tm.pgp, tm.conf, tm.tasks)
+			go tm.auditor.Run(tm.ctx)
+			break
+		}
+	}
 
 	tm.restart = make(chan struct{})
 	var wg sync.WaitGroup
