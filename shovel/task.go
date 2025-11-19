@@ -375,6 +375,17 @@ func (task *Task) Converge() error {
 	if err != nil {
 		return fmt.Errorf("unable to start tx: %w", err)
 	}
+	// Serialize all task updates and deletes for this (src, ig) pair using
+	// a transaction-scoped advisory lock. This mirrors the pattern in
+	// cmd/shovel/main.go, which calls:
+	//
+	//   dbtx.Exec(ctx, "select pg_advisory_xact_lock($1)", wpg.LockHash("main.migrate"))
+	//
+	// Here we reuse the precomputed task.lockid so that both the main task
+	// loop and the auditor share the same lock namespace.
+	if _, err := pgtx.Exec(ctx, "select pg_advisory_xact_lock($1)", task.lockid); err != nil {
+		return fmt.Errorf("acquiring task lock: %w", err)
+	}
 	defer pgtx.Rollback(ctx)
 
 	for reorgs := 0; reorgs <= 1000; reorgs++ {
@@ -432,12 +443,11 @@ func (task *Task) Converge() error {
 		}
 		ctx = wctx.WithNumLimit(ctx, localNum+1, delta)
 		var (
-			blocks        []eth.Block
-			consensusHash []byte
+			blocks []eth.Block
 		)
 		if task.consensus != nil {
 			// Consensus fetch (all providers)
-			blocks, consensusHash, err = task.consensus.FetchWithQuorum(ctx, &task.filter, localNum+1, delta)
+			blocks, _, err = task.consensus.FetchWithQuorum(ctx, &task.filter, localNum+1, delta)
 			// Reorg detection for consensus path, mirroring legacy load behavior
 			if err == nil && len(blocks) > 0 {
 				first := blocks[0]
@@ -469,6 +479,9 @@ func (task *Task) Converge() error {
 		pgtx, err = task.pgp.Begin(ctx)
 		if err != nil {
 			return fmt.Errorf("starting insert pg tx: %w", err)
+		}
+		if _, err := pgtx.Exec(ctx, "select pg_advisory_xact_lock($1)", task.lockid); err != nil {
+			return fmt.Errorf("acquiring task lock: %w", err)
 		}
 	nrows, err := task.insert(ctx, pgtx, blocks)
 	if err != nil {
@@ -526,6 +539,10 @@ func (task *Task) Converge() error {
 				if err != nil {
 					return fmt.Errorf("starting cleanup tx: %w", err)
 				}
+				if _, err := cleanupTx.Exec(ctx, "select pg_advisory_xact_lock($1)", task.lockid); err != nil {
+					cleanupTx.Rollback(ctx)
+					return fmt.Errorf("acquiring task lock: %w", err)
+				}
 
 				if _, err := cleanupTx.Exec(ctx, q, task.srcName, task.destConfig.Name, b.Num()); err != nil {
 					cleanupTx.Rollback(ctx)
@@ -561,12 +578,11 @@ func (task *Task) Converge() error {
 					audit_status,
 					provider_set,
 					created_at
-				) values ($1, $2, $3, $4, 'healthy', $5, now())
+				) values ($1, $2, $3, $4, 'pending', $5, now())
 				on conflict (src_name, ig_name, block_num)
 				do update set
 					consensus_hash = excluded.consensus_hash,
-					audit_status = 'healthy',
-					last_verified_at = now()
+					provider_set = excluded.provider_set
 			`
 			providerSet := make([]string, len(task.consensus.providers))
 			for i, p := range task.consensus.providers {
@@ -577,17 +593,23 @@ func (task *Task) Converge() error {
 				pgtx.Rollback(ctx)
 				return fmt.Errorf("marshaling provider set: %w", err)
 			}
-			lastBlock := blocks[len(blocks)-1]
-			_, err = pgtx.Exec(ctx, q,
-				task.srcName,
-				task.destConfig.Name,
-				lastBlock.Num(),
-				consensusHash,
-				providerSetJSON,
-			)
-			if err != nil {
-				pgtx.Rollback(ctx)
-				return fmt.Errorf("updating block_verification: %w", err)
+			// Store per-block hashes so that Phase 3 audits can validate a single
+			// block against the same HashBlocks([]eth.Block{b}) value used here.
+			// This mirrors the pattern used by the receipt validator, which builds
+			// a per-block hash before validating receipts.
+			for _, b := range blocks {
+				blockHash := HashBlocks([]eth.Block{b})
+				_, err = pgtx.Exec(ctx, q,
+					task.srcName,
+					task.destConfig.Name,
+					b.Num(),
+					blockHash,
+					providerSetJSON,
+				)
+				if err != nil {
+					pgtx.Rollback(ctx)
+					return fmt.Errorf("updating block_verification: %w", err)
+				}
 			}
 		}
 		if err := pgtx.Commit(ctx); err != nil {
@@ -827,12 +849,13 @@ func TaskUpdates(ctx context.Context, pg wpg.Conn) ([]TaskUpdate, error) {
 // based on config stored in the DB and in the config file.
 type Manager struct {
 	ctx     context.Context
-	running sync.Mutex
-	restart chan struct{}
-	tasks   []*Task
-	updates chan uint64
 	pgp     *pgxpool.Pool
 	conf    config.Root
+	tasks   []*Task
+	restart chan struct{}
+	updates chan uint64
+	running sync.Mutex
+	auditor *Auditor
 }
 
 func NewManager(ctx context.Context, pgp *pgxpool.Pool, conf config.Root) *Manager {
@@ -905,6 +928,15 @@ func (tm *Manager) Run(ec chan error) {
 		return
 	}
 	close(ec)
+
+	// Start auditor if any source has audit enabled
+	for _, sc := range tm.conf.Sources {
+		if sc.Audit.Enabled {
+			tm.auditor = NewAuditor(tm.pgp, tm.conf, tm.tasks)
+			go tm.auditor.Run(tm.ctx)
+			break
+		}
+	}
 
 	tm.restart = make(chan struct{})
 	var wg sync.WaitGroup
