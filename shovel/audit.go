@@ -20,6 +20,7 @@ type Auditor struct {
 	pgp      *pgxpool.Pool
 	conf     config.Root
 	sources  map[string][]*jrpc2.Client
+	metrics map[string]*Metrics
 	tasks    []*Task
 	interval time.Duration
 
@@ -36,6 +37,7 @@ func NewAuditor(pgp *pgxpool.Pool, conf config.Root, tasks []*Task) *Auditor {
 		conf:    conf,
 		tasks:   tasks,
 		sources: make(map[string][]*jrpc2.Client),
+		metrics: make(map[string]*Metrics),
 	}
 	for _, sc := range conf.Sources {
 		var clients []*jrpc2.Client
@@ -56,6 +58,8 @@ func NewAuditor(pgp *pgxpool.Pool, conf config.Root, tasks []*Task) *Auditor {
 			}
 			a.maxInFlight += int64(perSource)
 		}
+		// Initialize metrics for each source
+		a.metrics[sc.Name] = NewMetrics(sc.Name, "")
 	}
 	if a.interval == 0 {
 		a.interval = 5 * time.Second
@@ -101,28 +105,18 @@ func (a *Auditor) check(ctx context.Context) error {
 		if !sc.Audit.Enabled {
 			continue
 		}
-		// Query total pending count for accurate queue metric
+		// Update queue length metric using method from Phase 5
 		const countQ = `
-			SELECT COUNT(*)
+			SELECT count(*)
 			FROM shovel.block_verification bv
+			JOIN shovel.task_updates tu ON bv.src_name = tu.src_name AND bv.ig_name = tu.ig_name
 			WHERE bv.src_name = $1
 			  AND bv.audit_status IN ('pending', 'retrying')
-			  AND bv.block_num <= (
-			      SELECT MAX(tu.num) - $2
-			      FROM shovel.task_updates tu
-			      WHERE tu.src_name = bv.src_name AND tu.ig_name = bv.ig_name
-			  )
+			  AND bv.block_num <= (tu.num - $2)
 		`
-		var totalPending int
-		if err := a.pgp.QueryRow(ctx, countQ, sc.Name, sc.Audit.Confirmations).Scan(&totalPending); err != nil {
-			return fmt.Errorf("counting pending audits: %w", err)
-		}
-
-		// Track total queue length for this source
-		AuditQueueLength.WithLabelValues(sc.Name).Set(float64(totalPending))
-
-		if totalPending == 0 {
-			continue
+		var count int64
+		if err := a.pgp.QueryRow(ctx, countQ, sc.Name, sc.Audit.Confirmations).Scan(&count); err == nil {
+			a.metrics[sc.Name].SetAuditQueueLength(float64(count))
 		}
 
 		// Query blocks pending audit for this source. Instead of joining
@@ -234,6 +228,8 @@ func (a *Auditor) verify(ctx context.Context, sc config.Source, t auditTask) err
 		k = len(providers)
 	}
 
+	a.metrics[sc.Name].AuditAttempt(t.igName)
+
 	// Simple rotation: start at blockNum % len
 	startIdx := int(t.blockNum) % len(providers)
 
@@ -309,7 +305,7 @@ func (a *Auditor) verify(ctx context.Context, sc config.Source, t auditTask) err
 	}
 
 	// Record verification attempt (all audits, success or failure)
-	AuditVerifications.WithLabelValues(t.srcName, t.igName).Inc()
+	a.metrics[sc.Name].AuditAttempt(t.igName)
 
 	// If all K providers match, mark healthy
 	if matches == k {
@@ -323,7 +319,6 @@ func (a *Auditor) verify(ctx context.Context, sc config.Source, t auditTask) err
 	}
 
 	// Mismatch or failure -> Trigger Reindex
-	AuditFailures.WithLabelValues(t.srcName, t.igName).Inc()
 	slog.WarnContext(ctx, "audit mismatch",
 		"src", t.srcName,
 		"ig", t.igName,
@@ -373,6 +368,9 @@ func (a *Auditor) verify(ctx context.Context, sc config.Source, t auditTask) err
 		}
 		return nil
 	}
+
+	a.metrics[sc.Name].AuditFailure(t.igName)
+	a.metrics[sc.Name].ForcedReindex(t.igName)
 
 	// Update status to retrying
 	const r = `
