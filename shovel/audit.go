@@ -10,7 +10,6 @@ import (
 
 	"github.com/indexsupply/shovel/jrpc2"
 	"github.com/indexsupply/shovel/shovel/config"
-	"github.com/indexsupply/shovel/wpg"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
