@@ -15,14 +15,22 @@ This review covers the implementation of Phase 1 from `shovel_changes.md`: Multi
 ## Critical Issues Found
 
 ### 🔴 CRITICAL: Missing Provider Set Tracking
-**File**: `shovel/task.go:484-485`
+**Status:** ✅ Completed
+**File**: [`shovel/task.go:484-485`](shovel/task.go#L484-L485)
+
+**Current Code:**
 ```go
 // TODO: Store actual provider set IDs instead of dummy value
 providerSet := []byte(`["all"]`)
 ```
+
+**Context:** This appears in the `Converge()` method within the block verification insert loop at lines 486-498.
+
 **Issue**: The implementation uses a placeholder `["all"]` instead of tracking which specific providers participated in consensus. This makes it impossible to audit which providers were used for each block, defeating a key goal of the reconciliation strategy.
 
 **Impact**: HIGH - Cannot track provider reliability or debug consensus failures per provider.
+
+**Similar Pattern in Codebase:** The consensus engine at [`shovel/consensus.go:66-77`](shovel/consensus.go#L66-L77) has access to all providers via `ce.providers`, each with `.NextURL()` method to identify them.
 
 **Recommendation**: Store actual provider URLs/identifiers that participated in consensus:
 ```go
@@ -36,7 +44,10 @@ providerSetJSON, _ := json.Marshal(providerSet)
 ---
 
 ### 🔴 CRITICAL: Consensus Hash Not Validated on Reorg
-**File**: `shovel/task.go:428-434`
+**Status:** ✅ Completed
+**File**: [`shovel/task.go:428-434`](shovel/task.go#L428-L434)
+
+**Current Code:**
 ```go
 if task.consensus != nil {
     // Consensus fetch (all providers)
@@ -46,9 +57,20 @@ if task.consensus != nil {
     blocks, err = task.load(ctx, url, localHash, localNum+1, delta)
 }
 ```
+
 **Issue**: The `consensusHash` is computed but never validated against the previous local hash to detect reorgs. The legacy path checks for reorgs in `task.load()`, but the consensus path skips this critical check.
 
 **Impact**: HIGH - Reorgs may go undetected when consensus is enabled, leading to incorrect chain state.
+
+**Comparison with Legacy Path:** [`shovel/task.go:557-558`](shovel/task.go#L557-L558)
+```go
+first, last := blocks[0], blocks[len(blocks)-1]
+if len(first.Header.Parent) == 32 && !bytes.Equal(localHash, first.Header.Parent) {
+    return nil, ErrReorg
+}
+```
+
+The legacy `task.load()` method performs parent hash validation, but the consensus path at line 430 does not.
 
 **Recommendation**: Add reorg detection similar to the legacy path. You need to fetch the parent block hash and compare:
 ```go
@@ -66,7 +88,10 @@ if task.consensus != nil {
 ---
 
 ### 🟡 HIGH: Incomplete Log Hashing
-**File**: `shovel/consensus.go:160-170`
+**Status:** ✅ Completed
+**File**: [`shovel/consensus.go:160-170`](shovel/consensus.go#L160-L170)
+
+**Current Code:**
 ```go
 var buf bytes.Buffer
 for _, l := range logs {
@@ -80,13 +105,28 @@ for _, l := range logs {
     }
 }
 ```
+
 **Issue**: The hash doesn't include the log's `Address` field, which is a critical part of a log's identity. If two logs have identical topics, data, and indices but different addresses, they would hash to the same value.
 
 **Impact**: MEDIUM - Could cause false consensus on distinct logs from different contracts.
 
+**Log Structure Reference:** Per [`eth/types.go:141-150`](eth/types.go#L141-L150), the `Log` struct includes:
+```go
+type Log struct {
+    BlockNumber Uint64  `json:"blockNumber"`
+    TxHash      Bytes   `json:"transactionHash"`
+    Idx         Uint64  `json:"logIndex"`
+    Index       Uint64  `json:"transactionIndex"`
+    Address     Bytes   `json:"address"`  // ← Not included in hash!
+    Topics      []Bytes `json:"topics"`
+    Data        Bytes   `json:"data"`
+}
+```
+
 **Recommendation**: Include the address:
 ```go
-buf.Write(l.Address)
+buf.Write(l.Address)  // Add this first
+buf.Write([]byte(eth.EncodeUint64(uint64(l.BlockNumber))))
 buf.Write(l.TxHash)
 // ... rest of fields
 ```
@@ -94,15 +134,37 @@ buf.Write(l.TxHash)
 ---
 
 ### 🟡 HIGH: No Validation That Providers Meet Minimum
-**File**: `shovel/config/config.go:435-437`
+**Status:** ✅ Completed
+**File**: [`shovel/config/config.go:435-437`](shovel/config/config.go#L435-L437)
+
+**Current Code:**
 ```go
 if s.Consensus.Threshold > s.Consensus.Providers {
     return fmt.Errorf("consensus threshold (%d) cannot exceed providers (%d)", s.Consensus.Threshold, s.Consensus.Providers)
 }
 ```
+
 **Issue**: The config validation checks that threshold ≤ providers, but doesn't verify that the actual number of provider URLs matches the configured `Consensus.Providers` value.
 
 **Impact**: MEDIUM - Configuration could specify `providers: 3, threshold: 2` but only provide 1 URL, causing runtime failures.
+
+**Context:** The validation occurs after URLs are collected at [`shovel/config/config.go:392-403`](shovel/config/config.go#L392-L403):
+```go
+var urls []string
+urls = append(urls, string(x.URL))
+for _, url := range x.URLs {
+    urls = append(urls, string(url))
+}
+
+for _, u := range urls {
+    if len(u) == 0 {
+        continue
+    }
+    s.URLs = append(s.URLs, u)
+}
+```
+
+But there's no check that `len(s.URLs) >= s.Consensus.Providers` after this.
 
 **Recommendation**: Add validation:
 ```go
@@ -114,17 +176,44 @@ if len(s.URLs) < s.Consensus.Providers {
 ---
 
 ### 🟡 MEDIUM: Infinite Retry Without Circuit Breaker
-**File**: `shovel/consensus.go:46-125`
+**Status:** ✅ Completed
+**File**: [`shovel/consensus.go:46-125`](shovel/consensus.go#L46-L125)
+
+**Current Code:**
 ```go
-for attempt := 0; ; attempt++ {
-    // ... fetching and consensus logic
+for attempt := 0; ; attempt++ {  // ← Infinite loop
+    // Backoff if this is a retry
+    if attempt > 0 {
+        delay := conf.RetryBackoff * time.Duration(1<<(attempt-1))
+        if delay > conf.MaxBackoff {
+            delay = conf.MaxBackoff
+        }
+        select {
+        case <-ctx.Done():
+            return nil, nil, ctx.Err()
+        case <-time.After(delay):
+        }
+    }
+
+    // ... fetching and consensus logic ...
+
     if canonIdx >= 0 {
         // success
         return responses[canonIdx], []byte(canonHash), nil
     }
+
+    ce.metrics.Failure()
+    slog.WarnContext(ctx, "consensus-failed",
+        "n", start,
+        "threshold", conf.Threshold,
+        "votes", fmt.Sprintf("%v", counts),
+        "attempt", attempt+1,
+    )
+
     // Retry loop continues indefinitely
 }
 ```
+
 **Issue**: The consensus fetch will retry forever if providers never reach consensus. Per the plan (line 139): "All providers disagree: Keep retrying indefinitely until consensus is achieved." However, there's no circuit breaker or maximum retry limit to prevent resource exhaustion.
 
 **Impact**: MEDIUM - Could cause task to hang indefinitely, consuming resources without progress.
@@ -143,18 +232,27 @@ Or add a context deadline check in the loop.
 ---
 
 ### 🟡 MEDIUM: Missing Block Number Range in Consensus Hash
-**File**: `shovel/consensus.go:486-492`
+**Status:** ✅ Completed
+**File**: [`shovel/task.go:486-492`](shovel/task.go#L486-L492)
+
+**Current Code:**
 ```go
 for _, b := range blocks {
     _, err := pgtx.Exec(ctx, q,
         task.srcName,
         task.destConfig.Name,
-        b.Num(),
-        consensusHash,
+        b.Num(),           // ← Different block number
+        consensusHash,     // ← Same hash for all blocks
         providerSet,
     )
 ```
-**Issue**: The same `consensusHash` is written for every block in the batch, but the hash was computed across ALL blocks in the batch. This means blocks have the wrong verification hash stored.
+
+**Issue**: The same `consensusHash` is written for every block in the batch, but the hash was computed across ALL blocks in the batch at line 430:
+```go
+blocks, consensusHash, err = task.consensus.FetchWithQuorum(ctx, &task.filter, localNum+1, delta)
+```
+
+This means each block gets the same hash, but that hash represents the entire batch, not the individual block.
 
 **Impact**: MEDIUM - Audit verification in later phases will fail because block hashes don't match actual block content.
 
@@ -178,13 +276,17 @@ _, err := pgtx.Exec(ctx, q,
 ---
 
 ### 🟢 MINOR: Empty Block Edge Case
-**File**: `shovel/consensus.go:132-135`
+**Status:** ✅ Completed
+**File**: [`shovel/consensus.go:132-135`](shovel/consensus.go#L132-L135)
+
+**Current Code:**
 ```go
 func HashBlocks(blocks []eth.Block) []byte {
     if len(blocks) == 0 {
         return eth.Keccak([]byte("empty"))
     }
 ```
+
 **Issue**: Returns a static hash for empty blocks. If two different block ranges both have no matching logs, they'll hash to the same value. This could cause false positives in verification.
 
 **Impact**: LOW - Unlikely in practice since most blocks have some activity.
@@ -199,18 +301,33 @@ if len(blocks) == 0 {
 ---
 
 ### 🟢 MINOR: Provider Error Logging in Metrics
-**File**: `shovel/metrics.go:54-57`
+**Status:** ✅ Completed
+**File**: [`shovel/metrics.go:54-57`](shovel/metrics.go#L54-L57)
+
+**Current Code:**
 ```go
 func (m *Metrics) ProviderError(p string) {
     ProviderErrors.WithLabelValues(p).Inc()
-    slog.Error("provider error", "p", p)
+    slog.Error("provider error", "p", p)  // ← ERROR level for expected failures
 }
 ```
+
 **Issue**: Logs every provider error at ERROR level. In a multi-provider setup, transient errors are expected and this will create excessive noise.
 
 **Impact**: LOW - Operational noise, not functional impact.
 
-**Recommendation**: Log at WARN or DEBUG level, or add the error message:
+**Context**: This is called from [`shovel/consensus.go:74`](shovel/consensus.go#L74) when any provider fails:
+```go
+if err != nil {
+    errs[i] = err
+    ce.metrics.ProviderError(p.NextURL().String())
+    return nil // Don't fail the group, we handle errors individually
+}
+```
+
+Since the consensus engine continues with remaining providers, individual provider failures are expected operational events, not critical errors.
+
+**Recommendation**: Log at WARN or DEBUG level:
 ```go
 slog.Warn("provider error", "provider", p)
 ```
@@ -218,27 +335,40 @@ slog.Warn("provider error", "provider", p)
 ---
 
 ### 🟢 MINOR: Missing Context Cancellation Check
-**File**: `shovel/consensus.go:68-79`
+**Status:** ✅ Completed
+**File**: [`shovel/consensus.go:68-79`](shovel/consensus.go#L68-L79)
+
+**Current Code:**
 ```go
-eg.Go(func() error {
-    blocks, err := p.Get(ctx, p.NextURL().String(), filter, start, limit)
-    if err != nil {
-        errs[i] = err
-        ce.metrics.ProviderError(p.NextURL().String())
+for i, p := range ce.providers {
+    i, p := i, p
+    eg.Go(func() error {
+        blocks, err := p.Get(ctx, p.NextURL().String(), filter, start, limit)
+        if err != nil {
+            errs[i] = err
+            ce.metrics.ProviderError(p.NextURL().String())
+            return nil
+        }
+        responses[i] = blocks
         return nil
-    }
-    responses[i] = blocks
-    return nil
-})
+    })
+}
 ```
-**Issue**: The errgroup doesn't check if context is cancelled before starting fetches. If context is cancelled during the backoff sleep, the goroutines will still start.
+
+**Issue**: The errgroup doesn't check if context is cancelled before starting fetches. If context is cancelled during the backoff sleep (lines 48-57), the goroutines will still start.
 
 **Impact**: LOW - Slight resource waste on shutdown.
 
-**Recommendation**: Check context before starting:
+**Recommendation**: Check context before starting the parallel fetch loop:
 ```go
+// Before line 66
 if ctx.Err() != nil {
-    return ctx.Err()
+    return nil, nil, ctx.Err()
+}
+
+// Parallel fetch
+for i, p := range ce.providers {
+    // ...
 }
 ```
 
@@ -316,6 +446,13 @@ func TestTask_Converge_ConsensusReorg(t *testing.T) {
     // Verify ErrReorg returned
 }
 ```
+
+### Next Steps for Phase 1 (Tests)
+Implement the above test cases using existing patterns:
+
+1. Add `TestConsensusEngine_Disagreement` and `TestConsensusEngine_AllFail` to `shovel/consensus_test.go`, mirroring the style of `TestConsensusEngine_New` and `TestHashBlocks_Deterministic` and reusing the `mockClient` helper.
+2. Add `TestTask_Converge_ConsensusReorg` in a new consensus-aware converge test, using mock providers similar to `mockClient` to simulate a mismatched parent hash and assert `ErrReorg`.
+3. Extend `shovel/shovel/config/config_test.go` with a case that feeds a source config where `consensus.providers` exceeds the number of URLs and asserts that `ValidateFix`/`UnmarshalJSON` returns a descriptive error.
 
 ---
 
