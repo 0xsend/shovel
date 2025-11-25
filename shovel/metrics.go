@@ -35,6 +35,16 @@ var (
 		Name: "shovel_receipt_mismatch_total",
 		Help: "Number of receipt validation mismatches",
 	}, []string{"src_name"})
+
+	RepairRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "shovel_repair_requests_total",
+		Help: "Total number of repair requests received",
+	}, []string{"src_name", "ig_name"})
+
+	RepairBlocksReprocessed = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "shovel_repair_blocks_reprocessed_total",
+		Help: "Total number of blocks reprocessed by repair jobs",
+	}, []string{"src_name", "ig_name"})
 )
 
 type Metrics struct {
