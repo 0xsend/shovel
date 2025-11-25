@@ -17,6 +17,7 @@ type Auditor struct {
 	pgp     *pgxpool.Pool
 	conf    config.Root
 	sources map[string][]*jrpc2.Client
+	metrics map[string]*Metrics
 	tasks   []*Task
 }
 
@@ -26,6 +27,7 @@ func NewAuditor(pgp *pgxpool.Pool, conf config.Root, tasks []*Task) *Auditor {
 		conf:    conf,
 		tasks:   tasks,
 		sources: make(map[string][]*jrpc2.Client),
+		metrics: make(map[string]*Metrics),
 	}
 	for _, sc := range conf.Sources {
 		var clients []*jrpc2.Client
@@ -33,6 +35,7 @@ func NewAuditor(pgp *pgxpool.Pool, conf config.Root, tasks []*Task) *Auditor {
 			clients = append(clients, jrpc2.New(u))
 		}
 		a.sources[sc.Name] = clients
+		a.metrics[sc.Name] = NewMetrics(sc.Name)
 	}
 	return a
 }
@@ -64,6 +67,20 @@ func (a *Auditor) check(ctx context.Context) error {
 		if !sc.Audit.Enabled {
 			continue
 		}
+		// Update queue length metric
+		const countQ = `
+			SELECT count(*)
+			FROM shovel.block_verification bv
+			JOIN shovel.task_updates tu ON bv.src_name = tu.src_name AND bv.ig_name = tu.ig_name
+			WHERE bv.src_name = $1
+			  AND bv.audit_status IN ('pending', 'retrying')
+			  AND bv.block_num <= (tu.num - $2)
+		`
+		var count int64
+		if err := a.pgp.QueryRow(ctx, countQ, sc.Name, sc.Audit.Confirmations).Scan(&count); err == nil {
+			a.metrics[sc.Name].SetAuditQueueLength(float64(count))
+		}
+
 		// Query blocks pending audit for this source
 		const q = `
 			SELECT bv.src_name, bv.ig_name, bv.block_num, bv.consensus_hash
@@ -147,6 +164,8 @@ func (a *Auditor) verify(ctx context.Context, sc config.Source, t auditTask) err
 		k = len(providers)
 	}
 
+	a.metrics[sc.Name].AuditAttempt(t.igName)
+
 	// Simple rotation: start at blockNum % len
 	startIdx := int(t.blockNum) % len(providers)
 	
@@ -196,6 +215,9 @@ func (a *Auditor) verify(ctx context.Context, sc config.Source, t auditTask) err
 		"matches", matches,
 		"required", k,
 	)
+
+	a.metrics[sc.Name].AuditFailure(t.igName)
+	a.metrics[sc.Name].ForcedReindex(t.igName)
 
 	// Update status to retrying
 	const r = `
