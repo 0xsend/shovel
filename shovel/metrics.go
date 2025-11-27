@@ -30,6 +30,11 @@ var (
 		Name: "shovel_provider_error_total",
 		Help: "RPC errors per provider",
 	}, []string{"provider"})
+
+	ReceiptMismatch = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "shovel_receipt_mismatch_total",
+		Help: "Number of receipt validation mismatches",
+	}, []string{"src_name"})
 )
 
 type Metrics struct {
@@ -54,6 +59,10 @@ func (m *Metrics) Failure() {
 func (m *Metrics) ProviderError(p string) {
 	ProviderErrors.WithLabelValues(p).Inc()
 	slog.Warn("provider error", "p", p)
+}
+
+func (m *Metrics) ReceiptMismatch() {
+	ReceiptMismatch.WithLabelValues(m.src).Inc()
 }
 
 func (m *Metrics) Stop() {
