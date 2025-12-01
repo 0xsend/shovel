@@ -105,6 +105,11 @@ func TestIntegrations(t *testing.T) {
 			"select count(*) = 0 from seaport_test",
 		},
 	}
+	mainnetRPC := os.Getenv("MAINNET_RPC_URL")
+	if mainnetRPC == "" {
+		t.Skip("MAINNET_RPC_URL not set, skipping integration test")
+	}
+
 	for _, c := range cases {
 		var (
 			ctx  = context.Background()
@@ -117,7 +122,7 @@ func TestIntegrations(t *testing.T) {
 		for _, ig := range conf.Integrations {
 			task, err := NewTask(
 				WithPG(pg),
-				WithSource(jrpc2.New("https://practical-flashy-research.quiknode.pro/caae41d41b732f1f0872c8fa3ca2fe66ebb76a93/")),
+				WithSource(jrpc2.New(mainnetRPC)),
 				WithIntegration(ig),
 				WithRange(c.blockNum, c.blockNum+1),
 			)
@@ -128,7 +133,7 @@ func TestIntegrations(t *testing.T) {
 		for _, ig := range conf.Integrations {
 			task, err := NewTask(
 				WithPG(pg),
-				WithSource(jrpc2.New("https://practical-flashy-research.quiknode.pro/caae41d41b732f1f0872c8fa3ca2fe66ebb76a93/")),
+				WithSource(jrpc2.New(mainnetRPC)),
 				WithIntegration(ig),
 			)
 			tc.NoErr(t, err)
