@@ -18,35 +18,29 @@ import (
 	"github.com/indexsupply/shovel/wpg"
 )
 
-// TestBugReproduction_FaultyProviderMissingLogs reproduces the critical bug
-// documented in SEN-68 that Phases 1-3 were designed to fix.
+// TestBugReproduction_FaultyProviderMissingLogs tests that Shovel correctly indexes
+// all logs from block 17943843, which contains 4 ERC-721 Transfer events.
 //
-// THE BUG:
-// Before multi-provider consensus (Phase 1), Shovel uses a single RPC provider.
-// If that provider returns incomplete logs due to:
-// - Bloom filter issues (known Geth bug)
-// - Receipt storage corruption
+// BUG CONTEXT (SEN-68):
+// Before multi-provider consensus (Phase 1-3), a single faulty RPC provider could return
+// incomplete logs due to:
+// - Bloom filter issues (https://github.com/ethereum/go-ethereum/issues/18198)
+// - Receipt storage corruption (https://github.com/ethereum/go-ethereum/issues/21770)
 // - Rate limiting returning partial results
 // - Chain reorgs during query
 // - Node sync lag
-// 
-// Then Shovel will faithfully index the incomplete data, mark the block as
-// processed, and NEVER recover those missing events without manual intervention.
 //
-// REPRODUCTION SCENARIO:
-// Block 17943843 contains 4 ERC-721 Transfer events. A faulty provider returns
-// the block structure correctly but with 0 logs in eth_getLogs response.
-// Shovel will:
-// 1. Accept the empty logs as truth
-// 2. Insert 0 rows into erc721_test table
-// 3. Mark block 17943843 as processed in task_updates
-// 4. Move on to the next block
-// 5. Never revisit this block
+// When a faulty provider returns empty logs [], Shovel would:
+// 1. Accept the empty array without validation
+// 2. Insert 0 rows into the database
+// 3. Mark the block as processed
+// 4. Never recover the missing events
 //
-// EXPECTED: 4 Transfer events indexed
-// ACTUAL: 0 events indexed, block marked complete
+// TEST BEHAVIOR:
+// - With correct implementation (Phase 1-3): Test PASSES (4 events indexed)
+// - With buggy implementation (current): Test FAILS (0 events indexed)
 //
-// This test demonstrates the bug exists in the current main branch.
+// This test simulates a faulty provider to verify the bug is fixed.
 func TestBugReproduction_FaultyProviderMissingLogs(t *testing.T) {
 	var (
 		ctx  = context.Background()
@@ -90,30 +84,55 @@ func TestBugReproduction_FaultyProviderMissingLogs(t *testing.T) {
 			method := req["method"].(string)
 			id := req["id"]
 			
-			switch method {
-			case "eth_getBlockByNumber":
-				// Return valid block with correct hash
-				responses = append(responses, map[string]any{
-					"jsonrpc": "2.0",
-					"id":      id,
-					"result": map[string]any{
-						"number":     fmt.Sprintf("0x%x", targetBlock),
-						"hash":       blockHash,
-						"parentHash": parentBlockHash,
-						"timestamp":  "0x64e43a9f",
-						// Empty transactions array - this is the bug!
-						// Real block has transactions but provider returns empty
-						"transactions": []any{},
+		switch method {
+		case "eth_getBlockByNumber":
+			// Return valid block with transactions
+			// This block SHOULD have 4 ERC-721 Transfer event logs
+			responses = append(responses, map[string]any{
+				"jsonrpc": "2.0",
+				"id":      id,
+				"result": map[string]any{
+					"number":     fmt.Sprintf("0x%x", targetBlock),
+					"hash":       blockHash,
+					"parentHash": parentBlockHash,
+					"timestamp":  "0x64e43a9f",
+					"gasLimit":   "0x1c9c380",
+					"gasUsed":    "0x1234567",
+					// Block has transactions - this is key!
+					// Real block 17943843 has tx 0x713df81a... with 4 Transfer events
+					"transactions": []any{
+						map[string]any{
+							"blockHash":        blockHash,
+							"blockNumber":      fmt.Sprintf("0x%x", targetBlock),
+							"from":             "0xce020e4bca3a181cacd771a4750e03f384779313",
+							"gas":              "0x5208",
+							"gasPrice":         "0x12a05f200",
+							"hash":             "0x713df81a2ab53db1d01531106fc5de43012a401ddc3e0586d522e5c55a162d42",
+							"input":            "0x",
+							"nonce":            "0x1",
+							"to":               "0x57f1887a8bf19b14fc0df6fd9b2acc9af147ea85",
+							"transactionIndex": "0x0",
+							"value":            "0x0",
+							"type":             "0x2",
+							"v":                "0x1",
+							"r":                "0x1234567890abcdef",
+							"s":                "0xfedcba0987654321",
+						},
 					},
-				})
-			case "eth_getLogs":
-				// Return EMPTY logs array - THIS IS THE BUG
-				// Real block has 4 ERC-721 events but faulty provider returns []
-				responses = append(responses, map[string]any{
-					"jsonrpc": "2.0",
-					"id":      id,
-					"result":  []any{}, // ← THE BUG: missing logs
-				})
+				},
+			})
+		case "eth_getLogs":
+			// Return EMPTY logs array - THIS IS THE BUG
+			// Block has transaction 0x713df81a... which emitted 4 ERC-721 Transfer events
+			// But faulty eth_getLogs returns [] (the known bug from GitHub issues)
+			// This is the exact scenario from:
+			// - https://github.com/ethereum/go-ethereum/issues/18198 (logs missing after restart)
+			// - https://github.com/ethereum/go-ethereum/issues/21770 (wrong number of logs)
+			responses = append(responses, map[string]any{
+				"jsonrpc": "2.0",
+				"id":      id,
+				"result":  []any{}, // ← THE BUG: block has txs but eth_getLogs returns empty
+			})
 			case "eth_getBlockByHash":
 				// For parent hash lookup
 				responses = append(responses, map[string]any{
@@ -163,18 +182,14 @@ func TestBugReproduction_FaultyProviderMissingLogs(t *testing.T) {
 	)
 	tc.NoErr(t, err)
 
-	// Execute the convergence - this will complete "successfully"
+	// Execute the convergence
 	err = task.Converge()
-	
-	// The bug: Converge returns no error even though we got bad data
-	if err != nil {
-		t.Logf("Converge returned error (unexpected): %v", err)
-	} else {
-		t.Logf("✓ Converge completed 'successfully' (this is the bug)")
-	}
+	tc.NoErr(t, err)
 
-	// VERIFY THE BUG: We should have 4 rows but instead have 0
-	var count int
+	// ASSERT: We should have indexed exactly 4 Transfer events
+	// This is the expected correct behavior based on integration_test.go lines 57-72
+	const expectedCount = 4
+	var actualCount int
 	query := fmt.Sprintf(`
 		select count(*) from erc721_test
 		where block_num = %d
@@ -182,62 +197,54 @@ func TestBugReproduction_FaultyProviderMissingLogs(t *testing.T) {
 		and contract = '\x57f1887a8bf19b14fc0df6fd9b2acc9af147ea85'
 	`, targetBlock)
 	
-	tc.NoErr(t, pg.QueryRow(ctx, query).Scan(&count))
+	tc.NoErr(t, pg.QueryRow(ctx, query).Scan(&actualCount))
 	
-	// This is the bug
-	if count == 0 {
-		t.Logf("✓ BUG REPRODUCED: Indexed 0 rows instead of expected 4")
-		t.Logf("  - Faulty provider returned empty logs for block %d", targetBlock)
-		t.Logf("  - Shovel accepted this incomplete data without validation")
-		t.Logf("  - No consensus check (Phase 1)")
-		t.Logf("  - No receipt validation (Phase 2)")
-		t.Logf("  - No confirmation audit (Phase 3)")
+	// Test PASSES when consensus/validation works (actualCount == 4)
+	// Test FAILS when bug exists (actualCount == 0)
+	if actualCount != expectedCount {
+		t.Errorf("\n========== BUG DETECTED ==========\n")
+		t.Errorf("Expected %d Transfer events, but got %d", expectedCount, actualCount)
+		t.Errorf("")
+		t.Errorf("FAILURE DETAILS:")
+		t.Errorf("  Block: %d", targetBlock)
+		t.Errorf("  Transaction: 0x713df81a2ab53db1d01531106fc5de43012a401ddc3e0586d522e5c55a162d42")
+		t.Errorf("  Expected: %d ERC-721 Transfer events", expectedCount)
+		t.Errorf("  Actual: %d events indexed", actualCount)
+		t.Errorf("")
+		t.Errorf("ROOT CAUSE:")
+		t.Errorf("  - Faulty provider returned eth_getLogs = []")
+		t.Errorf("  - Single provider (no consensus validation)")
+		t.Errorf("  - No receipt-level cross-validation")
+		t.Errorf("  - No post-confirmation audit")
+		t.Errorf("")
+		t.Errorf("IMPACT:")
+		t.Errorf("  - %d critical events silently missing from database", expectedCount-actualCount)
+		t.Errorf("  - Block marked complete, will never auto-recover")
+		t.Errorf("  - User balances incorrect, compliance gaps")
+		t.Errorf("")
+		t.Errorf("SOLUTION: Implement SEN-68 Phases 1-3")
+		t.Errorf("  Phase 1: Multi-provider consensus (2-of-3 agreement)")
+		t.Errorf("  Phase 2: Receipt validation (eth_getBlockReceipts)")
+		t.Errorf("  Phase 3: Confirmation audit loop")
+		t.Errorf("")
+		t.Errorf("See: https://github.com/ethereum/go-ethereum/issues/18198")
+		t.Errorf("     https://github.com/ethereum/go-ethereum/issues/21770")
+		t.Errorf("==================================\n")
 	} else {
-		t.Errorf("BUG NOT REPRODUCED: expected 0 rows, got %d", count)
-		t.Errorf("  The faulty provider test setup may be incorrect")
+		t.Logf("✓ SUCCESS: Indexed %d/%d events correctly", actualCount, expectedCount)
+		t.Logf("  Multi-provider consensus prevented data loss")
 	}
-
-	// VERIFY THE BUG IS PERMANENT: Block marked as processed
-	var taskNum uint64
-	err = pg.QueryRow(ctx, `
-		select num from shovel.task_updates
-		where src_name = $1
-		and ig_name = $2
-		order by num desc
-		limit 1
-	`, srcName, ig.Name).Scan(&taskNum)
-	
-	if err == nil && taskNum == targetBlock {
-		t.Logf("✓ Block %d marked as processed in task_updates", targetBlock)
-		t.Logf("  Without manual intervention, these missing events will NEVER be recovered")
-		t.Logf("  This is why SEN-68 was filed as URGENT priority")
-	} else {
-		t.Logf("Task updates state: num=%d, err=%v", taskNum, err)
-	}
-
-	// Additional context for the bug report
-	t.Logf("")
-	t.Logf("IMPACT:")
-	t.Logf("  - Critical business events silently missing from database")
-	t.Logf("  - Compliance reporting will have gaps")
-	t.Logf("  - User balances will be incorrect")
-	t.Logf("  - No alerts, no errors, no indication anything is wrong")
-	t.Logf("")
-	t.Logf("ROOT CAUSE:")
-	t.Logf("  - Single RPC provider (no redundancy)")
-	t.Logf("  - No validation of eth_getLogs completeness")
-	t.Logf("  - No post-confirmation auditing")
-	t.Logf("")
-	t.Logf("SOLUTION (Phases 1-3):")
-	t.Logf("  - Phase 1: Multi-provider consensus (2-of-3 must agree)")
-	t.Logf("  - Phase 2: Receipt validation (cross-check via eth_getBlockReceipts)")
-	t.Logf("  - Phase 3: Confirmation audit (re-verify after N confirmations)")
-	t.Logf("")
-	t.Logf("Provider calls made: %d", callCount)
 }
 
-// TestBugConditions_PartialLogs tests another variant of the bug where
-// a provider returns SOME logs but not ALL logs for a block.
+// TestBugConditions_PartialLogs tests that Shovel detects and handles the case
+// where a provider returns SOME logs but not ALL logs for a block.
+//
+// This is an even more subtle variant of the SEN-68 bug where incomplete data
+// is returned (2 of 4 events). This is harder to detect without consensus validation.
+//
+// TEST BEHAVIOR:
+// - With correct implementation: Test PASSES (detects partial data, requires consensus)
+// - With buggy implementation: Test FAILS (accepts 2 events, missing 2)
 func TestBugConditions_PartialLogs(t *testing.T) {
 	var (
 		ctx  = context.Background()
@@ -346,15 +353,32 @@ func TestBugConditions_PartialLogs(t *testing.T) {
 	)
 	tc.NoErr(t, err)
 
-	_ = task.Converge() // May fail due to parsing but that's ok
+	err = task.Converge()
+	tc.NoErr(t, err)
 
-	var count int
+	// ASSERT: Should have indexed all 4 events, not just the 2 returned by faulty provider
+	const expectedCount = 4
+	var actualCount int
 	query := fmt.Sprintf(`select count(*) from erc721_test where block_num = %d`, targetBlock)
-	pg.QueryRow(ctx, query).Scan(&count)
+	tc.NoErr(t, pg.QueryRow(ctx, query).Scan(&actualCount))
 	
-	t.Logf("Partial logs scenario: got %d events (expected 4)", count)
-	if count > 0 && count < 4 {
-		t.Logf("✓ PARTIAL BUG: Some events indexed but not all - even harder to detect!")
+	if actualCount != expectedCount {
+		t.Errorf("\n========== PARTIAL DATA BUG DETECTED ==========\n")
+		t.Errorf("Expected %d events, got %d (missing %d)", expectedCount, actualCount, expectedCount-actualCount)
+		t.Errorf("")
+		t.Errorf("This is the SUBTLE variant of SEN-68:")
+		t.Errorf("  - Provider returned SOME logs but not ALL")
+		t.Errorf("  - Harder to detect than complete empty response")
+		t.Errorf("  - Silent data corruption in production")
+		t.Errorf("")
+		t.Errorf("SOLUTION: Multi-provider consensus would detect:")
+		t.Errorf("  - Provider A: 2 events")
+		t.Errorf("  - Provider B: 4 events")
+		t.Errorf("  - Provider C: 4 events")
+		t.Errorf("  - Consensus: Reject Provider A, accept B/C (4 events)")
+		t.Errorf("==============================================\n")
+	} else {
+		t.Logf("✓ SUCCESS: Detected partial data and indexed all %d events", expectedCount)
 	}
 }
 
