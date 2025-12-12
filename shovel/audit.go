@@ -20,6 +20,7 @@ type Auditor struct {
 	pgp      *pgxpool.Pool
 	conf     config.Root
 	sources  map[string][]*jrpc2.Client
+	metrics map[string]*Metrics
 	tasks    []*Task
 	interval time.Duration
 
@@ -36,6 +37,7 @@ func NewAuditor(pgp *pgxpool.Pool, conf config.Root, tasks []*Task) *Auditor {
 		conf:    conf,
 		tasks:   tasks,
 		sources: make(map[string][]*jrpc2.Client),
+		metrics: make(map[string]*Metrics),
 	}
 	for _, sc := range conf.Sources {
 		var clients []*jrpc2.Client
@@ -64,6 +66,7 @@ func NewAuditor(pgp *pgxpool.Pool, conf config.Root, tasks []*Task) *Auditor {
 		// Fallback bound if all sources disabled; small, similar to a single
 		// source with Parallelism=4.
 		a.maxInFlight = 4
+		a.metrics[sc.Name] = NewMetrics(sc.Name)
 	}
 	return a
 }
@@ -101,6 +104,20 @@ func (a *Auditor) check(ctx context.Context) error {
 		if !sc.Audit.Enabled {
 			continue
 		}
+		// Update queue length metric
+		const countQ = `
+			SELECT count(*)
+			FROM shovel.block_verification bv
+			JOIN shovel.task_updates tu ON bv.src_name = tu.src_name AND bv.ig_name = tu.ig_name
+			WHERE bv.src_name = $1
+			  AND bv.audit_status IN ('pending', 'retrying')
+			  AND bv.block_num <= (tu.num - $2)
+		`
+		var count int64
+		if err := a.pgp.QueryRow(ctx, countQ, sc.Name, sc.Audit.Confirmations).Scan(&count); err == nil {
+			a.metrics[sc.Name].SetAuditQueueLength(float64(count))
+		}
+
 		// Query blocks pending audit for this source. Instead of joining
 		// directly against shovel.task_updates on every row, use a correlated
 		// subquery to compare against the latest task update per (src, ig)
@@ -205,6 +222,8 @@ func (a *Auditor) verify(ctx context.Context, sc config.Source, t auditTask) err
 	if k > len(providers) {
 		k = len(providers)
 	}
+
+	a.metrics[sc.Name].AuditAttempt(t.igName)
 
 	// Simple rotation: start at blockNum % len
 	startIdx := int(t.blockNum) % len(providers)
@@ -314,6 +333,9 @@ func (a *Auditor) verify(ctx context.Context, sc config.Source, t auditTask) err
 		}
 		return nil
 	}
+
+	a.metrics[sc.Name].AuditFailure(t.igName)
+	a.metrics[sc.Name].ForcedReindex(t.igName)
 
 	// Update status to retrying
 	const r = `

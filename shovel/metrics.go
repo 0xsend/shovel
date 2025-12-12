@@ -60,12 +60,31 @@ var (
 		Name: "shovel_repair_blocks_reprocessed_total",
 		Help: "Total number of blocks reprocessed by repair jobs",
 	}, []string{"src_name", "ig_name"})
+
+	ForcedReindex = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "shovel_forced_reindex_total",
+		Help: "Forced reindex operations triggered by receipt/audit mismatches",
+	}, []string{"src_name", "ig_name"})
+
+	AuditVerifications = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "shovel_audit_verifications_total",
+		Help: "Confirmation audits executed",
+	}, []string{"src_name", "ig_name"})
+
+	AuditFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "shovel_audit_failures_total",
+		Help: "Audits that detected divergence",
+	}, []string{"src_name", "ig_name"})
+
+	AuditQueueLength = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "shovel_audit_queue_length",
+		Help: "Number of confirmed blocks pending audit",
+	}, []string{"src_name"})
 )
 
 type Metrics struct {
 	start time.Time
 	src   string
-	once  sync.Once
 }
 
 func NewMetrics(src string) *Metrics {
@@ -90,8 +109,22 @@ func (m *Metrics) ReceiptMismatch() {
 	ReceiptMismatch.WithLabelValues(m.src).Inc()
 }
 
+func (m *Metrics) AuditAttempt(igName string) {
+	AuditVerifications.WithLabelValues(m.src, igName).Inc()
+}
+
+func (m *Metrics) AuditFailure(igName string) {
+	AuditFailures.WithLabelValues(m.src, igName).Inc()
+}
+
+func (m *Metrics) ForcedReindex(igName string) {
+	ForcedReindex.WithLabelValues(m.src, igName).Inc()
+}
+
+func (m *Metrics) SetAuditQueueLength(n float64) {
+	AuditQueueLength.WithLabelValues(m.src).Set(n)
+}
+
 func (m *Metrics) Stop() {
-	m.once.Do(func() {
-		ConsensusDuration.WithLabelValues(m.src).Observe(time.Since(m.start).Seconds())
-	})
+	ConsensusDuration.WithLabelValues(m.src).Observe(time.Since(m.start).Seconds())
 }
