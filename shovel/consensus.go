@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/indexsupply/shovel/eth"
@@ -15,10 +16,42 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+type circuitState int
+
+const (
+	circuitClosed circuitState = iota
+	circuitOpen
+	circuitHalfOpen
+)
+
+func (s circuitState) String() string {
+	switch s {
+	case circuitClosed:
+		return "closed"
+	case circuitOpen:
+		return "open"
+	case circuitHalfOpen:
+		return "half_open"
+	default:
+		return "unknown"
+	}
+}
+
+type circuitBreakerState struct {
+	mu               sync.Mutex
+	state            circuitState
+	failureCount     int
+	halfOpenCalls    int
+	lastFailureTime  time.Time
+	lastStateChange  time.Time
+}
+
 type ConsensusEngine struct {
 	providers []*jrpc2.Client
 	config    config.Consensus
 	metrics   *Metrics
+	circuits  map[string]*circuitBreakerState
+	mu        sync.Mutex
 }
 
 func NewConsensusEngine(providers []*jrpc2.Client, conf config.Consensus, metrics *Metrics) (*ConsensusEngine, error) {
@@ -28,14 +61,153 @@ func NewConsensusEngine(providers []*jrpc2.Client, conf config.Consensus, metric
 	if conf.Threshold < 1 {
 		return nil, fmt.Errorf("threshold must be >= 1")
 	}
+	
+	// Initialize circuit breaker state map
+	// We lazily initialize circuits per URL on first use since we don't know
+	// which URLs will be selected by NextURL() rotation
+	circuits := make(map[string]*circuitBreakerState)
+	
 	return &ConsensusEngine{
 		providers: providers,
 		config:    conf,
 		metrics:   metrics,
+		circuits:  circuits,
 	}, nil
 }
 
 const maxConsensusAttempts = 1000
+
+// shouldSkip returns true if the circuit is open and hasn't timed out yet
+func (ce *ConsensusEngine) shouldSkip(url string) bool {
+	ce.mu.Lock()
+	cb, exists := ce.circuits[url]
+	if !exists {
+		// Lazy initialize circuit breaker for this URL
+		cb = &circuitBreakerState{
+			state:           circuitClosed,
+			lastStateChange: time.Now(),
+		}
+		ce.circuits[url] = cb
+		if ce.metrics != nil {
+			ce.metrics.CircuitBreakerStateChange(url, float64(circuitClosed))
+		}
+	}
+	ce.mu.Unlock()
+	
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	
+	if cb.state == circuitClosed {
+		return false
+	}
+	
+	if cb.state == circuitOpen {
+		// Check if timeout has elapsed to transition to half-open
+		if time.Since(cb.lastStateChange) >= ce.config.CircuitBreaker.OpenTimeout {
+			ce.transitionState(cb, url, circuitHalfOpen)
+			cb.halfOpenCalls = 0
+			return false
+		}
+		return true
+	}
+	
+	if cb.state == circuitHalfOpen {
+		// Allow limited calls in half-open state
+		if cb.halfOpenCalls >= ce.config.CircuitBreaker.HalfOpenMaxCalls {
+			return true
+		}
+		cb.halfOpenCalls++
+		return false
+	}
+	
+	return false
+}
+
+// recordSuccess resets failure count and closes circuit if in half-open state
+func (ce *ConsensusEngine) recordSuccess(url string) {
+	ce.mu.Lock()
+	cb, exists := ce.circuits[url]
+	if !exists {
+		// Lazy initialize circuit breaker for this URL
+		cb = &circuitBreakerState{
+			state:           circuitClosed,
+			lastStateChange: time.Now(),
+		}
+		ce.circuits[url] = cb
+		if ce.metrics != nil {
+			ce.metrics.CircuitBreakerStateChange(url, float64(circuitClosed))
+		}
+	}
+	ce.mu.Unlock()
+	
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	
+	// Reset failure count on success
+	cb.failureCount = 0
+	
+	// Close circuit if in half-open state
+	if cb.state == circuitHalfOpen {
+		ce.transitionState(cb, url, circuitClosed)
+	}
+}
+
+// recordFailure increments failure count and opens circuit if threshold exceeded
+func (ce *ConsensusEngine) recordFailure(url string) {
+	ce.mu.Lock()
+	cb, exists := ce.circuits[url]
+	if !exists {
+		// Lazy initialize circuit breaker for this URL
+		cb = &circuitBreakerState{
+			state:           circuitClosed,
+			lastStateChange: time.Now(),
+		}
+		ce.circuits[url] = cb
+		if ce.metrics != nil {
+			ce.metrics.CircuitBreakerStateChange(url, float64(circuitClosed))
+		}
+	}
+	ce.mu.Unlock()
+	
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	
+	cb.failureCount++
+	cb.lastFailureTime = time.Now()
+	
+	// Open circuit if failure threshold exceeded
+	if cb.state == circuitClosed && cb.failureCount >= ce.config.CircuitBreaker.FailureThreshold {
+		ce.transitionState(cb, url, circuitOpen)
+	} else if cb.state == circuitHalfOpen {
+		// Reopen circuit on failure in half-open state
+		ce.transitionState(cb, url, circuitOpen)
+		cb.failureCount = 0 // Reset for next half-open attempt
+	}
+}
+
+// transitionState changes circuit state and records metrics
+// Caller must hold cb.mu lock
+func (ce *ConsensusEngine) transitionState(cb *circuitBreakerState, url string, newState circuitState) {
+	if cb.state == newState {
+		return
+	}
+	
+	oldState := cb.state
+	cb.state = newState
+	cb.lastStateChange = time.Now()
+	
+	if ce.metrics != nil {
+		ce.metrics.CircuitBreakerTransition(url, oldState.String(), newState.String())
+		ce.metrics.CircuitBreakerStateChange(url, float64(newState))
+	}
+	
+	slog.Info("circuit-breaker-transition",
+		"provider", url,
+		"from", oldState.String(),
+		"to", newState.String(),
+		"failure_count", cb.failureCount,
+	)
+}
 
 func (ce *ConsensusEngine) FetchWithQuorum(ctx context.Context, filter *glf.Filter, start, limit uint64) ([]eth.Block, []byte, error) {
 	var (
@@ -69,21 +241,33 @@ func (ce *ConsensusEngine) FetchWithQuorum(ctx context.Context, filter *glf.Filt
 			eg        errgroup.Group
 			responses = make([][]eth.Block, len(ce.providers))
 			errs      = make([]error, len(ce.providers))
+			skipped   = make([]bool, len(ce.providers))
 		)
 		for i, p := range ce.providers {
 			i, p := i, p
 			eg.Go(func() error {
 				// Cache URL at start to avoid rotation drift across multiple calls
 				url := p.NextURL()
+				urlStr := url.String()
+				
+				// Skip provider if circuit is open
+				if ce.shouldSkip(urlStr) {
+					skipped[i] = true
+					slog.DebugContext(ctx, "skipping-provider-circuit-open", "url", urlStr)
+					return nil
+				}
+				
 				// Use Get method directly, similar to how Task.load works
 				// but without the batching loop since we want exact range
-				blocks, err := p.Get(ctx, url.String(), filter, start, limit)
+				blocks, err := p.Get(ctx, urlStr, filter, start, limit)
 				if err != nil {
 					errs[i] = err
-					ce.metrics.ProviderError(url.String())
+					ce.metrics.ProviderError(urlStr)
+					ce.recordFailure(urlStr)
 					return nil // Don't fail the group, we handle errors individually
 				}
 				responses[i] = blocks
+				ce.recordSuccess(urlStr)
 				return nil
 			})
 		}
@@ -98,7 +282,7 @@ func (ce *ConsensusEngine) FetchWithQuorum(ctx context.Context, filter *glf.Filt
 			canonIdx  int = -1
 		)
 		for i, blocks := range responses {
-			if errs[i] != nil {
+			if skipped[i] || errs[i] != nil {
 				continue
 			}
 			h := HashBlocksWithRange(blocks, start, limit)

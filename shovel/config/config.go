@@ -345,10 +345,17 @@ type Source struct {
 }
 
 type Consensus struct {
-	Providers    int           `json:"providers"`
-	Threshold    int           `json:"threshold"`
-	RetryBackoff time.Duration `json:"retry_backoff"`
-	MaxBackoff   time.Duration `json:"max_backoff"`
+	Providers      int            `json:"providers"`
+	Threshold      int            `json:"threshold"`
+	RetryBackoff   time.Duration  `json:"retry_backoff"`
+	MaxBackoff     time.Duration  `json:"max_backoff"`
+	CircuitBreaker CircuitBreaker `json:"circuit_breaker"`
+}
+
+type CircuitBreaker struct {
+	FailureThreshold int           `json:"failure_threshold"`
+	OpenTimeout      time.Duration `json:"open_timeout"`
+	HalfOpenMaxCalls int           `json:"half_open_max_calls"`
 }
 
 func (s *Source) UnmarshalJSON(d []byte) error {
@@ -364,10 +371,15 @@ func (s *Source) UnmarshalJSON(d []byte) error {
 		Concurrency  wos.EnvInt      `json:"concurrency"`
 		BatchSize    wos.EnvInt      `json:"batch_size"`
 		Consensus    struct {
-			Providers    wos.EnvInt    `json:"providers"`
-			Threshold    wos.EnvInt    `json:"threshold"`
-			RetryBackoff wos.EnvString `json:"retry_backoff"`
-			MaxBackoff   wos.EnvString `json:"max_backoff"`
+			Providers      wos.EnvInt    `json:"providers"`
+			Threshold      wos.EnvInt    `json:"threshold"`
+			RetryBackoff   wos.EnvString `json:"retry_backoff"`
+			MaxBackoff     wos.EnvString `json:"max_backoff"`
+			CircuitBreaker struct {
+				FailureThreshold wos.EnvInt    `json:"failure_threshold"`
+				OpenTimeout      wos.EnvString `json:"open_timeout"`
+				HalfOpenMaxCalls wos.EnvInt    `json:"half_open_max_calls"`
+			} `json:"circuit_breaker"`
 		} `json:"consensus"`
 	}{}
 	if err := json.Unmarshal(d, &x); err != nil {
@@ -430,6 +442,27 @@ func (s *Source) UnmarshalJSON(d []byte) error {
 			const tag = "unable to parse max_backoff value: %s"
 			return fmt.Errorf(tag, string(x.Consensus.MaxBackoff))
 		}
+	}
+
+	// Circuit breaker defaults
+	s.Consensus.CircuitBreaker.FailureThreshold = int(x.Consensus.CircuitBreaker.FailureThreshold)
+	if s.Consensus.CircuitBreaker.FailureThreshold == 0 {
+		s.Consensus.CircuitBreaker.FailureThreshold = 5
+	}
+
+	s.Consensus.CircuitBreaker.OpenTimeout = 60 * time.Second
+	if len(x.Consensus.CircuitBreaker.OpenTimeout) > 0 {
+		var err error
+		s.Consensus.CircuitBreaker.OpenTimeout, err = time.ParseDuration(string(x.Consensus.CircuitBreaker.OpenTimeout))
+		if err != nil {
+			const tag = "unable to parse circuit_breaker.open_timeout value: %s"
+			return fmt.Errorf(tag, string(x.Consensus.CircuitBreaker.OpenTimeout))
+		}
+	}
+
+	s.Consensus.CircuitBreaker.HalfOpenMaxCalls = int(x.Consensus.CircuitBreaker.HalfOpenMaxCalls)
+	if s.Consensus.CircuitBreaker.HalfOpenMaxCalls == 0 {
+		s.Consensus.CircuitBreaker.HalfOpenMaxCalls = 3
 	}
 
 	if len(s.URLs) > 0 && len(s.URLs) < s.Consensus.Providers {

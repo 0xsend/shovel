@@ -332,6 +332,93 @@ Example minimal config:
 }
 ```
 
+### Consensus Configuration and RPC Budget Planning
+
+When using multi-provider consensus (Phase 1 of the reconciliation strategy), Shovel queries K providers in parallel for each block range to achieve quorum. This provides data completeness guarantees but increases RPC usage.
+
+**RPC Budget Impact:**
+
+Baseline RPC calls per ingestion cycle:
+```
+K providers × N block ranges = K× baseline RPC requests
+```
+
+**Example Calculations:**
+
+- **Configuration:** 3 providers, threshold = 2, batch size = 100 blocks
+- **Block range:** 1,000 blocks = 10 batches
+- **Baseline calls:** 3 providers × 10 batches = 30 `eth_getLogs` calls
+- **Additional overhead:**
+  - Retry queue: Adds calls when consensus fails (typically <5% of baseline)
+  - Circuit breaker: Reduces wasted calls by skipping open-circuit providers
+  - Header/receipt validation: Additional calls for Phase 2/3 (separate from consensus)
+
+**Cost Planning Guidelines:**
+
+1. **Set threshold based on reliability requirements:**
+   - `threshold = 1`: Single provider must respond (no consensus, K× cost)
+   - `threshold = 2`: Two providers must agree (minimal consensus, K× cost)
+   - `threshold = K`: All providers must agree (strict consensus, K× cost)
+
+2. **Balance provider count vs. RPC quota:**
+   - More providers = higher data reliability but K× RPC costs
+   - Fewer providers = lower costs but reduced fault tolerance
+   - Typical production: 3 providers with threshold = 2
+
+3. **Circuit breaker reduces wasted calls:**
+   - Faulty providers are temporarily removed from rotation after `failure_threshold` consecutive errors
+   - Circuit reopens after `open_timeout` (default 60s) to allow recovery
+   - Prevents quota waste on persistently failing endpoints
+
+4. **Monitor consensus metrics:**
+   - `shovel_consensus_attempts_total` - Total consensus evaluations
+   - `shovel_consensus_failures_total` - Failed consensus attempts (retry queue)
+   - `shovel_provider_error_total` - Per-provider error rates
+   - `shovel_circuit_breaker_state` - Circuit breaker states per provider
+
+**Configuration Example:**
+
+```json
+{
+  "eth_sources": [
+    {
+      "name": "mainnet",
+      "chain_id": 1,
+      "urls": [
+        "https://provider1.example.com",
+        "https://provider2.example.com",
+        "https://provider3.example.com"
+      ],
+      "consensus": {
+        "providers": 3,
+        "threshold": 2,
+        "retry_backoff": "2s",
+        "max_backoff": "30s",
+        "circuit_breaker": {
+          "failure_threshold": 5,
+          "open_timeout": "60s",
+          "half_open_max_calls": 3
+        }
+      }
+    }
+  ]
+}
+```
+
+**When to use consensus:**
+
+- Critical applications requiring data completeness guarantees
+- When using RPC providers with unknown reliability
+- When RPC quota permits K× overhead
+- When consensus cost < cost of missing data
+
+**When to skip consensus:**
+
+- Single highly reliable RPC provider (e.g., dedicated node)
+- Tight RPC budget constraints
+- Non-critical indexing where occasional missed logs are acceptable
+- Testing/development environments
+
 ## TypeScript Config Package
 
 The `shovel-config-ts/` directory contains a TypeScript package for programmatically building Shovel configuration files. Publishedto npm as `@indexsupply/shovel-config`.
