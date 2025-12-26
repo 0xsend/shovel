@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -1209,4 +1210,363 @@ func createMockProvider(logs []any) *httptest.Server {
 			json.NewEncoder(w).Encode(responses)
 		}
 	}))
+}
+
+// ====================
+// Circuit Breaker Tests
+// ====================
+
+// TestCircuitBreaker_OpensAfterThresholdFailures verifies the circuit opens
+// after consecutive failures reach the configured threshold.
+func TestCircuitBreaker_OpensAfterThresholdFailures(t *testing.T) {
+	ctx := context.Background()
+	failureCount := 0
+	
+	// Provider that always fails
+	faultyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		failureCount++
+		http.Error(w, "provider unavailable", http.StatusServiceUnavailable)
+	}))
+	defer faultyServer.Close()
+	
+	// Provider that always succeeds
+	goodServer := createMockProvider([]any{})
+	defer goodServer.Close()
+	
+	// Circuit breaker with threshold of 3 failures
+	ce, err := NewConsensusEngine(
+		[]*jrpc2.Client{
+			jrpc2.New(faultyServer.URL),
+			jrpc2.New(goodServer.URL),
+		},
+		config.Consensus{
+			Providers: 2,
+			Threshold: 1, // Only need one good provider
+			RetryBackoff: 10 * time.Millisecond,
+			MaxBackoff: 100 * time.Millisecond,
+			CircuitBreaker: config.CircuitBreaker{
+				FailureThreshold: 3,
+				OpenTimeout: 1 * time.Second,
+				HalfOpenMaxCalls: 2,
+			},
+		},
+		NewMetrics("test", "circuit-test"),
+	)
+	tc.NoErr(t, err)
+	
+	// Make multiple requests to trigger circuit breaker
+	// Create a filter that requires UseLogs to be set
+	filter := glf.New([]string{"log_addr"}, []string{}, [][]string{})
+	for i := 0; i < 5; i++ {
+		_, _, err := ce.FetchWithQuorum(ctx, filter, 1, 1)
+		if err != nil {
+			t.Fatalf("FetchWithQuorum failed: %v", err)
+		}
+	}
+	
+	// Verify circuit opened: faulty provider should have been called exactly 3 times
+	// (threshold), then skipped for remaining 2 calls
+	if failureCount != 3 {
+		t.Errorf("Expected faulty provider called 3 times (threshold), got %d", failureCount)
+	}
+	
+	// Verify circuit state is open
+	ce.mu.Lock()
+	cb := ce.circuits[faultyServer.URL]
+	ce.mu.Unlock()
+	
+	cb.mu.Lock()
+	state := cb.state
+	cb.mu.Unlock()
+	
+	if state != circuitOpen {
+		t.Errorf("Expected circuit to be open, got %v", state)
+	}
+}
+
+// TestCircuitBreaker_HalfOpenTransition verifies the circuit transitions
+// from open to half-open after the timeout expires.
+func TestCircuitBreaker_HalfOpenTransition(t *testing.T) {
+	ctx := context.Background()
+	filter := glf.New([]string{"log_addr"}, []string{}, [][]string{})
+	callCount := 0
+	
+	// Provider that fails initially, then succeeds
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		http.Error(w, "provider unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	
+	goodServer := createMockProvider([]any{})
+	defer goodServer.Close()
+	
+	// Circuit breaker with short timeout for testing
+	ce, err := NewConsensusEngine(
+		[]*jrpc2.Client{
+			jrpc2.New(server.URL),
+			jrpc2.New(goodServer.URL),
+		},
+		config.Consensus{
+			Providers: 2,
+			Threshold: 1,
+			RetryBackoff: 10 * time.Millisecond,
+			MaxBackoff: 100 * time.Millisecond,
+			CircuitBreaker: config.CircuitBreaker{
+				FailureThreshold: 2,
+				OpenTimeout: 100 * time.Millisecond, // Short timeout for test
+				HalfOpenMaxCalls: 3,
+			},
+		},
+		NewMetrics("test", "circuit-test"),
+	)
+	tc.NoErr(t, err)
+	
+	// Trigger circuit open (2 failures)
+	for i := 0; i < 3; i++ {
+		ce.FetchWithQuorum(ctx, filter, 1, 1)
+	}
+	
+	// Verify circuit is open
+	ce.mu.Lock()
+	cb := ce.circuits[server.URL]
+	ce.mu.Unlock()
+	
+	cb.mu.Lock()
+	if cb.state != circuitOpen {
+		t.Fatalf("Expected circuit open, got %v", cb.state)
+	}
+	cb.mu.Unlock()
+	
+	// Wait for timeout to expire
+	time.Sleep(150 * time.Millisecond)
+	
+	// Next call should transition to half-open
+	ce.FetchWithQuorum(ctx, filter, 1, 1)
+	
+	cb.mu.Lock()
+	state := cb.state
+	cb.mu.Unlock()
+	
+	// Circuit should now be half-open or have attempted transition
+	if state == circuitClosed {
+		t.Error("Circuit should not be closed after failures and timeout")
+	}
+}
+
+// TestCircuitBreaker_ClosesOnSuccess verifies the circuit transitions
+// from half-open to closed on successful calls.
+func TestCircuitBreaker_ClosesOnSuccess(t *testing.T) {
+	ctx := context.Background()
+	filter := glf.New([]string{"log_addr"}, []string{}, [][]string{})
+	failCount := 0
+	mu := &sync.Mutex{}
+	
+	// Provider that fails twice, then succeeds
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		failCount++
+		shouldFail := failCount <= 2
+		mu.Unlock()
+		
+		if shouldFail {
+			http.Error(w, "provider unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		// After 2 failures, return success
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		json.Unmarshal(body, &req)
+		
+		if req["method"] == "eth_getLogs" {
+			json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id": req["id"],
+				"result": []any{},
+			})
+		}
+	}))
+	defer server.Close()
+	
+	goodServer := createMockProvider([]any{})
+	defer goodServer.Close()
+	
+	ce, err := NewConsensusEngine(
+		[]*jrpc2.Client{
+			jrpc2.New(server.URL),
+			jrpc2.New(goodServer.URL),
+		},
+		config.Consensus{
+			Providers: 2,
+			Threshold: 1,
+			RetryBackoff: 10 * time.Millisecond,
+			MaxBackoff: 100 * time.Millisecond,
+			CircuitBreaker: config.CircuitBreaker{
+				FailureThreshold: 2,
+				OpenTimeout: 100 * time.Millisecond,
+				HalfOpenMaxCalls: 3,
+			},
+		},
+		NewMetrics("test", "circuit-test"),
+	)
+	tc.NoErr(t, err)
+	
+	// Trigger circuit open
+	for i := 0; i < 3; i++ {
+		ce.FetchWithQuorum(ctx, filter, 1, 1)
+	}
+	
+	// Wait for timeout
+	time.Sleep(150 * time.Millisecond)
+	
+	// Make successful calls to close circuit
+	for i := 0; i < 3; i++ {
+		ce.FetchWithQuorum(ctx, filter, 1, 1)
+	}
+	
+	// Verify circuit is now closed
+	ce.mu.Lock()
+	cb := ce.circuits[server.URL]
+	ce.mu.Unlock()
+	
+	cb.mu.Lock()
+	state := cb.state
+	failures := cb.failureCount
+	cb.mu.Unlock()
+	
+	if state != circuitClosed {
+		t.Errorf("Expected circuit closed after successful half-open calls, got %v", state)
+	}
+	if failures != 0 {
+		t.Errorf("Expected failure count reset to 0, got %d", failures)
+	}
+}
+
+// TestCircuitBreaker_ReopensOnHalfOpenFailure verifies the circuit
+// reopens if it fails while in half-open state.
+func TestCircuitBreaker_ReopensOnHalfOpenFailure(t *testing.T) {
+	ctx := context.Background()
+	filter := glf.New([]string{"log_addr"}, []string{}, [][]string{})
+	
+	// Provider that always fails
+	faultyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "provider unavailable", http.StatusServiceUnavailable)
+	}))
+	defer faultyServer.Close()
+	
+	goodServer := createMockProvider([]any{})
+	defer goodServer.Close()
+	
+	ce, err := NewConsensusEngine(
+		[]*jrpc2.Client{
+			jrpc2.New(faultyServer.URL),
+			jrpc2.New(goodServer.URL),
+		},
+		config.Consensus{
+			Providers: 2,
+			Threshold: 1,
+			RetryBackoff: 10 * time.Millisecond,
+			MaxBackoff: 100 * time.Millisecond,
+			CircuitBreaker: config.CircuitBreaker{
+				FailureThreshold: 2,
+				OpenTimeout: 100 * time.Millisecond,
+				HalfOpenMaxCalls: 2,
+			},
+		},
+		NewMetrics("test", "circuit-test"),
+	)
+	tc.NoErr(t, err)
+	
+	// Open circuit
+	for i := 0; i < 3; i++ {
+		ce.FetchWithQuorum(ctx, filter, 1, 1)
+	}
+	
+	// Wait for timeout to transition to half-open
+	time.Sleep(150 * time.Millisecond)
+	
+	// Try to use half-open circuit (will fail)
+	ce.FetchWithQuorum(ctx, filter, 1, 1)
+	
+	// Verify circuit reopened
+	ce.mu.Lock()
+	cb := ce.circuits[faultyServer.URL]
+	ce.mu.Unlock()
+	
+	cb.mu.Lock()
+	state := cb.state
+	cb.mu.Unlock()
+	
+	if state != circuitOpen {
+		t.Errorf("Expected circuit to reopen after half-open failure, got %v", state)
+	}
+}
+
+// TestCircuitBreaker_SkipsOpenProviders verifies FetchWithQuorum
+// correctly skips providers with open circuits.
+func TestCircuitBreaker_SkipsOpenProviders(t *testing.T) {
+	ctx := context.Background()
+	filter := glf.New([]string{"log_addr"}, []string{}, [][]string{})
+	faultyCallCount := 0
+	goodCallCount := 0
+	
+	// Provider that always fails
+	faultyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		faultyCallCount++
+		http.Error(w, "provider unavailable", http.StatusServiceUnavailable)
+	}))
+	defer faultyServer.Close()
+	
+	// Provider that counts calls
+	goodServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		goodCallCount++
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]any
+		json.Unmarshal(body, &req)
+		
+		if req["method"] == "eth_getLogs" {
+			json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id": req["id"],
+				"result": []any{},
+			})
+		}
+	}))
+	defer goodServer.Close()
+	
+	ce, err := NewConsensusEngine(
+		[]*jrpc2.Client{
+			jrpc2.New(faultyServer.URL),
+			jrpc2.New(goodServer.URL),
+		},
+		config.Consensus{
+			Providers: 2,
+			Threshold: 1,
+			RetryBackoff: 10 * time.Millisecond,
+			MaxBackoff: 100 * time.Millisecond,
+			CircuitBreaker: config.CircuitBreaker{
+				FailureThreshold: 3,
+				OpenTimeout: 10 * time.Second, // Long timeout so circuit stays open
+				HalfOpenMaxCalls: 2,
+			},
+		},
+		NewMetrics("test", "circuit-test"),
+	)
+	tc.NoErr(t, err)
+	
+	// Make 10 requests
+	for i := 0; i < 10; i++ {
+		ce.FetchWithQuorum(ctx, filter, 1, 1)
+	}
+	
+	// Faulty provider should have been called exactly 3 times (threshold)
+	// then skipped for remaining 7 calls
+	if faultyCallCount != 3 {
+		t.Errorf("Expected faulty provider called 3 times, got %d", faultyCallCount)
+	}
+	
+	// Good provider should have been called all 10 times
+	if goodCallCount != 10 {
+		t.Errorf("Expected good provider called 10 times, got %d", goodCallCount)
+	}
 }

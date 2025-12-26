@@ -30,6 +30,16 @@ var (
 		Name: "shovel_provider_error_total",
 		Help: "RPC errors per provider",
 	}, []string{"provider"})
+
+	CircuitBreakerState = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "shovel_circuit_breaker_state",
+		Help: "Circuit breaker state per provider (0=closed, 1=open, 2=half_open)",
+	}, []string{"src_name", "ig_name", "provider"})
+
+	CircuitBreakerTransitions = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "shovel_circuit_breaker_transitions_total",
+		Help: "Circuit breaker state transitions",
+	}, []string{"src_name", "ig_name", "provider", "from_state", "to_state"})
 )
 
 type Metrics struct {
@@ -61,4 +71,12 @@ func (m *Metrics) Stop() {
 	m.once.Do(func() {
 		ConsensusDuration.WithLabelValues(m.src, m.ig).Observe(time.Since(m.start).Seconds())
 	})
+}
+
+func (m *Metrics) CircuitBreakerTransition(provider, fromState, toState string) {
+	CircuitBreakerTransitions.WithLabelValues(m.src, m.ig, provider, fromState, toState).Inc()
+}
+
+func (m *Metrics) CircuitBreakerStateChange(provider string, state float64) {
+	CircuitBreakerState.WithLabelValues(m.src, m.ig, provider).Set(state)
 }
