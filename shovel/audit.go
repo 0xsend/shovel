@@ -107,12 +107,14 @@ func (a *Auditor) check(ctx context.Context) error {
 		}
 		// Update queue length metric using method from Phase 5
 		const countQ = `
-			SELECT count(*)
-			FROM shovel.block_verification bv
-			JOIN shovel.task_updates tu ON bv.src_name = tu.src_name AND bv.ig_name = tu.ig_name
+			SELECT COUNT(*) FROM shovel.block_verification bv
 			WHERE bv.src_name = $1
 			  AND bv.audit_status IN ('pending', 'retrying')
-			  AND bv.block_num <= (tu.num - $2)
+			  AND bv.block_num <= (
+			      SELECT MAX(tu.num) - $2
+			      FROM shovel.task_updates tu
+			      WHERE tu.src_name = bv.src_name AND tu.ig_name = bv.ig_name
+			  )
 		`
 		var count int64
 		if err := a.pgp.QueryRow(ctx, countQ, sc.Name, sc.Audit.Confirmations).Scan(&count); err == nil {
@@ -227,8 +229,6 @@ func (a *Auditor) verify(ctx context.Context, sc config.Source, t auditTask) err
 	if k > len(providers) {
 		k = len(providers)
 	}
-
-	a.metrics[sc.Name].AuditAttempt(t.igName)
 
 	// Simple rotation: start at blockNum % len
 	startIdx := int(t.blockNum) % len(providers)
