@@ -317,14 +317,14 @@ func (c *Client) httpPoll(ctx context.Context, url string) {
 			ID:      "1",
 			Version: "2.0",
 			Method:  "eth_getBlockByNumber",
-			Params:  []any{"latest", false},
+			Params:  []any{"safe", false},
 		})
 		if err != nil {
 			c.lcache.error(err)
 			return
 		}
 		if hresp.Error.Exists() {
-			const tag = "eth_getBlockByNumber/latest"
+			const tag = "eth_getBlockByNumber/safe"
 			c.lcache.error(fmt.Errorf("rpc=%s %w", tag, hresp.Error))
 			return
 		}
@@ -365,13 +365,13 @@ func (c *Client) Latest(ctx context.Context, url string, n uint64) (uint64, []by
 		ID:      fmt.Sprintf("latest-%d-%x", n, randbytes()),
 		Version: "2.0",
 		Method:  "eth_getBlockByNumber",
-		Params:  []any{"latest", false},
+		Params:  []any{"safe", false},
 	})
 	if err != nil {
 		return 0, nil, fmt.Errorf("unable request latest: %w", err)
 	}
 	if hresp.Error.Exists() {
-		const tag = "eth_getBlockByNumber/latest"
+		const tag = "eth_getBlockByNumber/safe"
 		return 0, nil, fmt.Errorf("rpc=%s %w", tag, hresp.Error)
 	}
 	slog.DebugContext(ctx, "http-get-latest",
