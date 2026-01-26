@@ -33,18 +33,18 @@ func NewConsensusEngine(providers []*jrpc2.Client, conf config.Consensus, metric
 	if conf.Threshold < 1 {
 		return nil, fmt.Errorf("threshold must be >= 1")
 	}
-	// Validate Byzantine Fault Tolerance requirements:
-	// For BFT: N >= 3f + 1, where threshold >= 2f + 1
-	// This means: threshold >= 2 * ((len(providers) - 1) / 3) + 1
-	// Example: 3 providers requires threshold >= 2, 4 providers requires threshold >= 3
-	minThreshold := 2*((len(providers)-1)/3) + 1
-	if conf.Threshold < minThreshold {
-		return nil, fmt.Errorf("threshold (%d) insufficient for BFT with %d providers (need >= %d)", conf.Threshold, len(providers), minThreshold)
-	}
 	// Initial provider count: use configured value or all providers if not specified
 	initialProviders := conf.Providers
 	if initialProviders <= 0 || initialProviders > len(providers) {
 		initialProviders = len(providers)
+	}
+	// Validate Byzantine Fault Tolerance requirements:
+	// For BFT: N >= 3f + 1, where threshold >= 2f + 1
+	// This means: threshold >= 2 * ((initialProviders - 1) / 3) + 1
+	// Example: 3 providers requires threshold >= 2, 4 providers requires threshold >= 3
+	minThreshold := 2*((initialProviders-1)/3) + 1
+	if conf.Threshold < minThreshold {
+		return nil, fmt.Errorf("threshold (%d) insufficient for BFT with %d providers (need >= %d)", conf.Threshold, initialProviders, minThreshold)
 	}
 	return &ConsensusEngine{
 		providers:        providers,
@@ -88,9 +88,12 @@ func (ce *ConsensusEngine) FetchWithQuorum(ctx context.Context, filter *glf.Filt
 
 		// Backoff if this is a retry
 		if attempt > 0 {
-			delay := conf.RetryBackoff * time.Duration(1<<(attempt-1))
-			if delay > conf.MaxBackoff {
-				delay = conf.MaxBackoff
+			delay := conf.MaxBackoff
+			if attempt-1 < 63 {
+				delay = conf.RetryBackoff * time.Duration(1<<(attempt-1))
+				if delay > conf.MaxBackoff || delay <= 0 {
+					delay = conf.MaxBackoff
+				}
 			}
 			select {
 			case <-ctx.Done():

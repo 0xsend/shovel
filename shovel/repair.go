@@ -81,7 +81,7 @@ func (rs *RepairService) HandleRepairRequest(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "start_block must be <= end_block", http.StatusBadRequest)
 		return
 	}
-	if req.EndBlock-req.StartBlock > 10000 {
+	if req.EndBlock-req.StartBlock+1 > 10000 {
 		http.Error(w, "Range exceeds maximum of 10,000 blocks", http.StatusBadRequest)
 		return
 	}

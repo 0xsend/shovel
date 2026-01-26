@@ -153,6 +153,30 @@ func TestHandleRepairRequest(t *testing.T) {
 			t.Errorf("expected 400, got %d", w.Code)
 		}
 	})
+
+	t.Run("range too large inclusive", func(t *testing.T) {
+		reqBody := `{"source": "foo", "integration": "bar", "start_block": 0, "end_block": 10000}`
+		req := httptest.NewRequest("POST", "/api/v1/repair", strings.NewReader(reqBody))
+		w := httptest.NewRecorder()
+
+		rs.HandleRepairRequest(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("expected 400, got %d", w.Code)
+		}
+	})
+
+	t.Run("range max ok", func(t *testing.T) {
+		reqBody := `{"source": "foo", "integration": "bar", "start_block": 0, "end_block": 9999, "dry_run": true}`
+		req := httptest.NewRequest("POST", "/api/v1/repair", strings.NewReader(reqBody))
+		w := httptest.NewRecorder()
+
+		rs.HandleRepairRequest(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200, got %d", w.Code)
+		}
+	})
 }
 
 func TestRepairList(t *testing.T) {

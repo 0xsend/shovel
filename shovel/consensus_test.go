@@ -63,6 +63,14 @@ func TestConsensusEngine_New(t *testing.T) {
 	if err != nil {
 		t.Errorf("expected no error for threshold=3 with 4 providers, got: %v", err)
 	}
+
+	// With 5 providers, but initialProviders=3, threshold should be validated against initialProviders
+	p5 := []*jrpc2.Client{{}, {}, {}, {}, {}}
+	c = config.Consensus{Providers: 3, Threshold: 2}
+	_, err = NewConsensusEngine(p5, c, nil)
+	if err != nil {
+		t.Errorf("expected no error for threshold=2 with 5 providers and initialProviders=3, got: %v", err)
+	}
 }
 
 func TestHashBlocks_Deterministic(t *testing.T) {
@@ -78,6 +86,36 @@ func TestHashBlocks_Deterministic(t *testing.T) {
 
 	if !bytes.Equal(h1, h2) {
 		t.Error("hash should be deterministic regardless of log order")
+	}
+}
+
+func TestConsensus_BackoffOverflow(t *testing.T) {
+	errorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "upstream error", http.StatusInternalServerError)
+	}))
+	defer errorServer.Close()
+
+	providers := []*jrpc2.Client{
+		jrpc2.New(errorServer.URL),
+		jrpc2.New(errorServer.URL),
+	}
+	conf := config.Consensus{
+		Providers:    2,
+		Threshold:    2,
+		RetryBackoff: 1 * time.Millisecond,
+		MaxBackoff:   1 * time.Millisecond,
+		MaxAttempts:  70,
+	}
+	ce, err := NewConsensusEngine(providers, conf, NewMetrics("test", "backoff"))
+	tc.NoErr(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	filter := &glf.Filter{UseLogs: true}
+	_, _, err = ce.FetchWithQuorum(ctx, filter, 1, 1)
+	if err == nil {
+		t.Fatal("expected consensus failure error")
 	}
 }
 
