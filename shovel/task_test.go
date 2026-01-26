@@ -7,6 +7,7 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/indexsupply/shovel/dig"
 	"github.com/indexsupply/shovel/eth"
@@ -166,6 +167,24 @@ func checkQuery(tb testing.TB, pg wpg.Conn, query string, args ...any) {
 	diff.Test(tb, tb.Fatalf, err, nil)
 	if !found {
 		tb.Errorf("query\n%s\nreturned false", query)
+	}
+}
+
+func TestManagerRestartStopsAuditor(t *testing.T) {
+	pg := testpg(t)
+	tm := NewManager(context.Background(), pg, config.Root{})
+
+	canceled := make(chan struct{})
+	tm.auditorCancel = func() {
+		close(canceled)
+	}
+
+	tc.NoErr(t, tm.Restart())
+
+	select {
+	case <-canceled:
+	case <-time.After(1 * time.Second):
+		t.Fatal("expected auditor context cancellation on restart")
 	}
 }
 

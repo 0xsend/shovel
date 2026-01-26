@@ -1102,14 +1102,15 @@ func TaskUpdates(ctx context.Context, pg wpg.Conn) ([]TaskUpdate, error) {
 // Loads, Starts, and provides method for Restarting tasks
 // based on config stored in the DB and in the config file.
 type Manager struct {
-	ctx     context.Context
-	pgp     *pgxpool.Pool
-	conf    config.Root
-	tasks   []*Task
-	restart chan struct{}
-	updates chan uint64
-	running sync.Mutex
-	auditor *Auditor
+	ctx           context.Context
+	pgp           *pgxpool.Pool
+	conf          config.Root
+	tasks         []*Task
+	restart       chan struct{}
+	updates       chan uint64
+	running       sync.Mutex
+	auditor       *Auditor
+	auditorCancel context.CancelFunc
 }
 
 func NewManager(ctx context.Context, pgp *pgxpool.Pool, conf config.Root) *Manager {
@@ -1175,6 +1176,11 @@ func (tm *Manager) Run(ec chan error) {
 	tm.running.Lock()
 	defer tm.running.Unlock()
 
+	if tm.auditorCancel != nil {
+		tm.auditorCancel()
+		tm.auditorCancel = nil
+	}
+
 	var err error
 	tm.tasks, err = loadTasks(tm.ctx, tm.pgp, tm.conf)
 	if err != nil {
@@ -1187,7 +1193,9 @@ func (tm *Manager) Run(ec chan error) {
 	for _, sc := range tm.conf.Sources {
 		if sc.Audit.Enabled {
 			tm.auditor = NewAuditor(tm.pgp, tm.conf, tm.tasks)
-			go tm.auditor.Run(tm.ctx)
+			auditorCtx, cancel := context.WithCancel(tm.ctx)
+			tm.auditorCancel = cancel
+			go tm.auditor.Run(auditorCtx)
 			break
 		}
 	}
