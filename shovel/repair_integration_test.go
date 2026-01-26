@@ -82,7 +82,7 @@ func TestRepairReindexesData(t *testing.T) {
 		destConfig:  config.Integration{Name: "test_ig", Table: wpg.Table{Name: "shovel.test_repair_data"}},
 		dests:       []Destination{dest},
 		filter:      glf.Filter{},
-		batchSize:   10,  // Must be >= number of blocks to fetch all in one batch
+		batchSize:   10, // Must be >= number of blocks to fetch all in one batch
 		concurrency: 1,
 		lockid:      wpg.LockHash("test-repair-lock"),
 	}
@@ -221,14 +221,14 @@ func TestRepairOverlapPrevention(t *testing.T) {
 		endBlock   uint64
 		expectCode int
 	}{
-		{"overlap_at_start", 50, 150, http.StatusConflict},       // overlaps beginning
-		{"overlap_at_end", 150, 250, http.StatusConflict},        // overlaps end
-		{"fully_contained", 120, 180, http.StatusConflict},       // fully within
-		{"fully_contains", 50, 300, http.StatusConflict},         // fully contains
-		{"no_overlap_before", 50, 99, http.StatusOK},             // before, no overlap
-		{"no_overlap_after", 201, 300, http.StatusOK},            // after, no overlap
-		{"adjacent_before", 90, 99, http.StatusOK},               // adjacent but not overlapping
-		{"adjacent_after", 201, 210, http.StatusOK},              // adjacent but not overlapping
+		{"overlap_at_start", 50, 150, http.StatusConflict}, // overlaps beginning
+		{"overlap_at_end", 150, 250, http.StatusConflict},  // overlaps end
+		{"fully_contained", 120, 180, http.StatusConflict}, // fully within
+		{"fully_contains", 50, 300, http.StatusConflict},   // fully contains
+		{"no_overlap_before", 50, 99, http.StatusOK},       // before, no overlap
+		{"no_overlap_after", 201, 300, http.StatusOK},      // after, no overlap
+		{"adjacent_before", 90, 99, http.StatusOK},         // adjacent but not overlapping
+		{"adjacent_after", 201, 210, http.StatusOK},        // adjacent but not overlapping
 	}
 
 	for _, tc := range testCases {
@@ -499,9 +499,9 @@ func TestRepairForceAllProviders(t *testing.T) {
 // Mock helpers
 
 type mockSource struct {
-	blocks    []eth.Block
+	blocks     []eth.Block
 	callsByURL map[string]int
-	mu        sync.Mutex
+	mu         sync.Mutex
 }
 
 func (m *mockSource) Get(ctx context.Context, url string, filter *glf.Filter, start, limit uint64) ([]eth.Block, error) {
