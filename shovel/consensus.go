@@ -151,7 +151,7 @@ func (ce *ConsensusEngine) FetchWithQuorum(ctx context.Context, filter *glf.Filt
 				)
 				if err != nil {
 					errs[i] = err
-					ce.metrics.ProviderError(url.String())
+					ce.metrics.ProviderError(url.Hostname())
 					recordSpanError(providerSpan, err, "provider fetch failed")
 					return nil // Don't fail the group, we handle errors individually
 				}
@@ -215,7 +215,7 @@ func (ce *ConsensusEngine) FetchWithQuorum(ctx context.Context, filter *glf.Filt
 			if errs[i] != nil {
 				// Cache URL to get same one that was used in the request
 				url := activeProviders[i].NextURL()
-				failedProviders = append(failedProviders, url.String())
+				failedProviders = append(failedProviders, url.Hostname())
 			}
 		}
 		if len(failedProviders) > 0 {

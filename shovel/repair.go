@@ -3,6 +3,7 @@ package shovel
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -408,23 +409,122 @@ func (rs *RepairService) executeRepair(ctx context.Context, repairID string, req
 	var reindexErrors []string
 
 	if req.ForceAllProviders && task.consensus != nil {
-		// Force all providers mode: iterate through each provider individually
-		// This exhaustively queries every configured RPC endpoint instead of using consensus
-		for _, provider := range task.consensus.providers {
-			url := provider.NextURL().String()
-			slog.InfoContext(ctx, "repair-force-provider",
-				"repair_id", repairID,
-				"provider", url,
-				"blocks", fmt.Sprintf("%d-%d", req.StartBlock, req.EndBlock),
-			)
+		providers := task.consensus.providers
+		batchSize := uint64(task.batchSize)
 
-			// Reindex block range using this specific provider
-			n, err := rs.reindexBlocks(ctx, task, url, req.StartBlock, req.EndBlock)
-			if err != nil {
-				reindexErrors = append(reindexErrors, fmt.Sprintf("Provider %s: %v", url, err))
+		// Per-provider: accumulate per-batch hashes and track errors
+		type providerResult struct {
+			host   string
+			url    string
+			hashes []string // hex-encoded hash per batch
+			key    string   // joined hashes for voting
+			err    error
+		}
+		results := make([]providerResult, len(providers))
+
+		// Phase 1: Fetch from all providers batch-by-batch, hash each batch
+		for i, p := range providers {
+			pURL := p.NextURL()
+			results[i].host = pURL.Hostname()
+			results[i].url = pURL.String()
+
+			for blockNum := req.StartBlock; blockNum <= req.EndBlock; blockNum += batchSize {
+				limit := batchSize
+				if blockNum+limit-1 > req.EndBlock {
+					limit = req.EndBlock - blockNum + 1
+				}
+				blocks, err := p.Get(ctx, pURL.String(), &task.filter, blockNum, limit)
+				if err != nil {
+					results[i].err = fmt.Errorf("fetch %d-%d: %w", blockNum, blockNum+limit-1, err)
+					break
+				}
+				h := HashBlocksWithRange(blocks, blockNum, limit)
+				results[i].hashes = append(results[i].hashes, hex.EncodeToString(h))
+			}
+			if results[i].err == nil {
+				results[i].key = strings.Join(results[i].hashes, ",")
+			}
+		}
+
+		// Phase 2: Threshold-based vote (deterministic, matches consensus config)
+		threshold := task.consensus.config.Threshold
+		counts := make(map[string]int)
+		firstIdx := make(map[string]int)
+
+		for i, r := range results {
+			if r.err != nil {
+				reindexErrors = append(reindexErrors, fmt.Sprintf("Provider %s: %v", r.host, r.err))
 				continue
 			}
-			blocksReprocessed += n
+			if _, ok := firstIdx[r.key]; !ok {
+				firstIdx[r.key] = i
+			}
+			counts[r.key]++
+		}
+
+		// Select canonical: first hash reaching threshold (provider order = deterministic)
+		canonIdx := -1
+		for _, r := range results {
+			if r.err != nil {
+				continue
+			}
+			if counts[r.key] >= threshold {
+				canonIdx = firstIdx[r.key]
+				break
+			}
+		}
+
+		if canonIdx < 0 {
+			reindexErrors = append(reindexErrors, fmt.Sprintf(
+				"Consensus not reached (threshold=%d): votes=%v", threshold, counts))
+		} else {
+			canon := results[canonIdx]
+
+			// Phase 3: Log comparison results
+			for _, r := range results {
+				if r.err != nil {
+					continue
+				}
+				match := len(r.hashes) == len(canon.hashes)
+				if match {
+					for j := range r.hashes {
+						if r.hashes[j] != canon.hashes[j] {
+							match = false
+							break
+						}
+					}
+				}
+				slog.InfoContext(ctx, "repair-provider-result",
+					"repair_id", repairID,
+					"provider", r.host,
+					"match", match,
+					"batches", len(r.hashes),
+				)
+				if !match {
+					for j := range r.hashes {
+						if j < len(canon.hashes) && r.hashes[j] != canon.hashes[j] {
+							batchStart := req.StartBlock + uint64(j)*batchSize
+							slog.WarnContext(ctx, "repair-provider-divergence",
+								"repair_id", repairID,
+								"provider", r.host,
+								"canonical", canon.host,
+								"batch_start", batchStart,
+								"provider_hash", r.hashes[j][:16],
+								"canonical_hash", canon.hashes[j][:16],
+							)
+							break
+						}
+					}
+				}
+			}
+
+			// Phase 4: Insert once using the canonical provider
+			n, err := rs.reindexBlocks(ctx, task, canon.url, req.StartBlock, req.EndBlock)
+			if err != nil {
+				reindexErrors = append(reindexErrors, fmt.Sprintf("Provider %s: reindex: %v", canon.host, err))
+			} else {
+				blocksReprocessed = n
+			}
 		}
 	} else {
 		// Normal mode: use consensus or single provider (whatever task is configured with)
