@@ -471,7 +471,7 @@ func (rs *RepairService) reindexBlocks(ctx context.Context, task *Task, url stri
 	var totalReprocessed int
 
 	// Process in batches to avoid overwhelming memory and transactions
-	const batchSize = 100
+	batchSize := uint64(task.batchSize)
 	for blockNum := start; blockNum <= end; blockNum += batchSize {
 		batchEnd := blockNum + batchSize - 1
 		if batchEnd > end {

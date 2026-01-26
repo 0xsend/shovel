@@ -164,6 +164,112 @@ func TestRepairReindexesData(t *testing.T) {
 	}
 }
 
+// TestRepairUsesTaskBatchSize verifies repairs honor the task batchSize when reindexing.
+func TestRepairUsesTaskBatchSize(t *testing.T) {
+	pg := testpg(t)
+	ctx := context.Background()
+
+	// Create integration table
+	_, err := pg.Exec(ctx, `
+		CREATE TABLE shovel.test_repair_batchsize (
+			src_name text,
+			ig_name text,
+			block_num bigint
+		)
+	`)
+	tc.NoErr(t, err)
+
+	// Insert initial data
+	_, err = pg.Exec(ctx, `
+		INSERT INTO shovel.test_repair_batchsize (src_name, ig_name, block_num)
+		VALUES 
+			('test_src', 'test_ig', 100),
+			('test_src', 'test_ig', 101),
+			('test_src', 'test_ig', 102)
+	`)
+	tc.NoErr(t, err)
+
+	// Create mock source that returns data for reindexing
+	// Include block 99 for reorg detection (repair code fetches parent hash)
+	mockSrc := &mockSource{
+		blocks: []eth.Block{
+			newMockBlock(99, []byte("parent99"), []byte("parent98"), "parent_block"),
+			newMockBlock(100, []byte("hash1"), []byte("parent99"), "reindexed_data_100"),
+			newMockBlock(101, []byte("hash2"), []byte("hash1"), "reindexed_data_101"),
+			newMockBlock(102, []byte("hash3"), []byte("hash2"), "reindexed_data_102"),
+		},
+	}
+
+	dest := &mockDestination{
+		tableName: "shovel.test_repair_batchsize",
+		pgp:       pg,
+	}
+
+	task := &Task{
+		ctx:         ctx,
+		pgp:         pg,
+		src:         mockSrc,
+		srcName:     "test_src",
+		destConfig:  config.Integration{Name: "test_ig", Table: wpg.Table{Name: "shovel.test_repair_batchsize"}},
+		dests:       []Destination{dest},
+		filter:      glf.Filter{},
+		batchSize:   1, // Force one block per load() call
+		concurrency: 1,
+		lockid:      wpg.LockHash("test-repair-batchsize"),
+	}
+
+	mgr := &Manager{tasks: []*Task{task}}
+	conf := config.Root{
+		Sources: []config.Source{{Name: "test_src"}},
+		Integrations: []config.Integration{
+			{
+				Name:    "test_ig",
+				Enabled: true,
+				Table:   wpg.Table{Name: "shovel.test_repair_batchsize"},
+				Sources: []config.Source{{Name: "test_src"}},
+			},
+		},
+	}
+
+	rs := NewRepairService(pg, conf, mgr)
+
+	// Execute repair
+	reqBody := `{"source": "test_src", "integration": "test_ig", "start_block": 100, "end_block": 102}`
+	req := httptest.NewRequest("POST", "/api/v1/repair", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+	rs.HandleRepairRequest(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp RepairResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+
+	// Wait for completion
+	deadline := time.Now().Add(5 * time.Second)
+	var finalStatus RepairResponse
+	for time.Now().Before(deadline) {
+		reqStatus := httptest.NewRequest("GET", "/api/v1/repair/"+resp.RepairID, nil)
+		wStatus := httptest.NewRecorder()
+		rs.HandleRepairStatus(wStatus, reqStatus)
+		json.NewDecoder(wStatus.Body).Decode(&finalStatus)
+
+		if finalStatus.Status == "completed" || finalStatus.Status == "failed" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if finalStatus.Status != "completed" {
+		t.Fatalf("repair failed: %v", finalStatus.Errors)
+	}
+
+	if finalStatus.BlocksReprocessed != 3 {
+		t.Errorf("expected 3 blocks reprocessed, got %d", finalStatus.BlocksReprocessed)
+	}
+}
+
 // TestRepairOverlapPrevention verifies HTTP 409 is returned for overlapping repairs
 func TestRepairOverlapPrevention(t *testing.T) {
 	pg := testpg(t)
