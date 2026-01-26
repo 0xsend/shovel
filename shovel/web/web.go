@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -200,77 +199,55 @@ func (h *Handler) Prom(w http.ResponseWriter, r *http.Request) {
 	h.diagLastReq = time.Now()
 	h.diagLastReqMut.Unlock()
 
-	promhttp.Handler().ServeHTTP(w, r)
-
-	checkSource := func(srcName string, src shovel.Source) []string {
-		var (
-			res                 []string
-			start               = time.Now()
-			srcLatest, pgLatest uint64
-			pgErr, srcErr       int
-		)
-		// PG
-		const q = `
-			select num
-			from shovel.task_updates
-			where src_name = $1
-			order by num desc
-			limit 1
-		`
-		err := h.pgp.QueryRow(r.Context(), q, srcName).Scan(&pgLatest)
-		if err != nil {
-			pgErr++
-		}
-		res = append(res, "# HELP shovel_latest_block_local last block processed")
-		res = append(res, "# TYPE shovel_latest_block_local gauge")
-		res = append(res, fmt.Sprintf(`shovel_latest_block_local{src="%s"} %d`, srcName, pgLatest))
-
-		res = append(res, "# HELP shovel_pg_ping number of ms to make basic status query")
-		res = append(res, "# TYPE shovel_pg_ping gauge")
-		res = append(res, fmt.Sprintf(`shovel_pg_ping %d`, uint64(time.Since(start)/time.Millisecond)))
-
-		res = append(res, "# HELP shovel_pg_ping_error number of errors in making basic status query")
-		res = append(res, "# TYPE shovel_pg_ping_error gauge")
-		res = append(res, fmt.Sprintf(`shovel_pg_ping_error %d`, pgErr))
-
-		// Source
-		start = time.Now()
-		srcLatest, _, err = src.Latest(r.Context(), src.NextURL().String(), 0)
-		if err != nil {
-			srcErr++
-		}
-		res = append(res, "# HELP shovel_latest_block_remote latest block height from rpc api")
-		res = append(res, "# TYPE shovel_latest_block_remote gauge")
-		res = append(res, fmt.Sprintf(`shovel_latest_block_remote{src="%s"} %d`, srcName, srcLatest))
-
-		res = append(res, "# HELP shovel_rpc_ping number of ms to make a basic http request to rpc api")
-		res = append(res, "# TYPE shovel_rpc_ping gauge")
-		res = append(res, fmt.Sprintf(`shovel_rpc_ping{src="%s"} %d`, srcName, uint64(time.Since(start)/time.Millisecond)))
-
-		res = append(res, "# HELP shovel_rpc_ping_error number of errors in making basic rpc api request")
-		res = append(res, "# TYPE shovel_rpc_ping_error gauge")
-		res = append(res, fmt.Sprintf(`shovel_rpc_ping_error{src="%s"} %d`, srcName, srcErr))
-
-		// Delta
-		res = append(res, "# HELP shovel_delta number of blocks between the source and the shovel database")
-		res = append(res, "# TYPE shovel_delta gauge")
-		res = append(res, fmt.Sprintf(`shovel_delta{src="%s"} %d`, srcName, srcLatest-pgLatest))
-		return res
-	}
-
+	// Update diagnostic gauges before promhttp serializes the response.
+	// Previously these were appended as raw text after promhttp, which
+	// corrupts the response when promhttp applies gzip encoding.
 	scs, err := h.conf.AllSources(r.Context(), h.pgp)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	var res []string
 	for _, sc := range scs {
 		src := jrpc2.New(sc.URLs...)
-		for _, line := range checkSource(sc.Name, src) {
-			res = append(res, line)
-		}
+		h.updateSourceMetrics(r.Context(), sc.Name, src)
 	}
-	fmt.Fprint(w, strings.Join(res, "\n"))
+
+	promhttp.Handler().ServeHTTP(w, r)
+}
+
+func (h *Handler) updateSourceMetrics(ctx context.Context, srcName string, src shovel.Source) {
+	var pgLatest, srcLatest uint64
+
+	// PG query
+	start := time.Now()
+	const q = `
+		select num
+		from shovel.task_updates
+		where src_name = $1
+		order by num desc
+		limit 1
+	`
+	err := h.pgp.QueryRow(ctx, q, srcName).Scan(&pgLatest)
+	shovel.LatestBlockLocal.WithLabelValues(srcName).Set(float64(pgLatest))
+	shovel.PGPing.Set(float64(time.Since(start) / time.Millisecond))
+	if err != nil {
+		shovel.PGPingError.Set(1)
+	} else {
+		shovel.PGPingError.Set(0)
+	}
+
+	// RPC query
+	start = time.Now()
+	srcLatest, _, err = src.Latest(ctx, src.NextURL().String(), 0)
+	shovel.LatestBlockRemote.WithLabelValues(srcName).Set(float64(srcLatest))
+	shovel.RPCPing.WithLabelValues(srcName).Set(float64(time.Since(start) / time.Millisecond))
+	if err != nil {
+		shovel.RPCPingError.WithLabelValues(srcName).Set(1)
+	} else {
+		shovel.RPCPingError.WithLabelValues(srcName).Set(0)
+	}
+
+	shovel.ShovelDelta.WithLabelValues(srcName).Set(float64(srcLatest - pgLatest))
 }
 
 func (h *Handler) Diag(w http.ResponseWriter, r *http.Request) {

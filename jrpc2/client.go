@@ -821,6 +821,13 @@ func (c *Client) logs(ctx context.Context, url string, filter *glf.Filter, bm bl
 		tx := b.Tx(k.b)
 		tx.PrecompHash.Write(logs[0].TxHash)
 		for i := range logs {
+			// logResult's outer fields shadow eth.Log's promoted fields
+			// with the same JSON tags (blockNumber, transactionHash,
+			// transactionIndex). Copy them into the embedded Log so
+			// downstream consumers (HashBlocks, consensus) see correct values.
+			logs[i].Log.BlockNumber = logs[i].BlockNum
+			logs[i].Log.TxHash.Write(logs[i].TxHash)
+			logs[i].Log.TxIdx = logs[i].TxIdx
 			tx.Logs.Add(logs[i].Log)
 		}
 		b.Unlock()

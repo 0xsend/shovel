@@ -70,6 +70,42 @@ var (
 		Name: "shovel_repair_blocks_reprocessed_total",
 		Help: "Total number of blocks reprocessed by repair jobs",
 	}, []string{"src_name", "ig_name"})
+
+	// Diagnostic gauges updated on each /metrics scrape
+	LatestBlockLocal = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "shovel_latest_block_local",
+		Help: "last block processed",
+	}, []string{"src"})
+
+	PGPing = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "shovel_pg_ping",
+		Help: "number of ms to make basic status query",
+	})
+
+	PGPingError = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "shovel_pg_ping_error",
+		Help: "number of errors in making basic status query",
+	})
+
+	LatestBlockRemote = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "shovel_latest_block_remote",
+		Help: "latest block height from rpc api",
+	}, []string{"src"})
+
+	RPCPing = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "shovel_rpc_ping",
+		Help: "number of ms to make a basic http request to rpc api",
+	}, []string{"src"})
+
+	RPCPingError = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "shovel_rpc_ping_error",
+		Help: "number of errors in making basic rpc api request",
+	}, []string{"src"})
+
+	ShovelDelta = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "shovel_delta",
+		Help: "number of blocks between the source and the shovel database",
+	}, []string{"src"})
 )
 
 type Metrics struct {
@@ -84,6 +120,7 @@ func NewMetrics(src, ig string) *Metrics {
 }
 
 func (m *Metrics) Start() {
+	m.once = sync.Once{} // Reset so Stop() records duration for this call
 	m.start = time.Now()
 	ConsensusAttempts.WithLabelValues(m.src, m.ig).Inc()
 }
