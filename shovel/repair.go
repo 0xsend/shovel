@@ -597,6 +597,31 @@ func (rs *RepairService) reindexBlocks(ctx context.Context, task *Task, url stri
 		var blocks []eth.Block
 		var fetchErr error
 
+		var (
+			storedPrevHash []byte
+			hasStoredPrev  bool
+		)
+		if blockNum > 0 {
+			const prevHashQ = `
+				SELECT hash FROM shovel.task_updates
+				WHERE src_name = $1 AND ig_name = $2 AND num = $3
+			`
+			err := pgtx.QueryRow(ctx, prevHashQ, task.srcName, task.destConfig.Name, blockNum-1).Scan(&storedPrevHash)
+			switch {
+			case errors.Is(err, pgx.ErrNoRows):
+				slog.WarnContext(ctx, "repair-prev-hash-missing",
+					"block", blockNum-1,
+					"source", task.srcName,
+					"integration", task.destConfig.Name,
+				)
+			case err != nil:
+				pgtx.Rollback(ctx)
+				return totalReprocessed, fmt.Errorf("querying prev hash for %d: %w", blockNum-1, err)
+			default:
+				hasStoredPrev = true
+			}
+		}
+
 		for attempt := 0; attempt < maxReorgRetries; attempt++ {
 			if task.consensus != nil && url == "" {
 				// Consensus mode
@@ -607,8 +632,12 @@ func (rs *RepairService) reindexBlocks(ctx context.Context, task *Task, url stri
 					if len(first.Header.Parent) == 32 {
 						// Need to fetch previous block hash to detect reorg
 						var prevHash []byte
-						hashURL := task.src.NextURL().String()
-						prevHash, fetchErr = task.src.Hash(ctx, hashURL, blockNum-1)
+						if hasStoredPrev {
+							prevHash = storedPrevHash
+						} else {
+							hashURL := task.src.NextURL().String()
+							prevHash, fetchErr = task.src.Hash(ctx, hashURL, blockNum-1)
+						}
 						if fetchErr == nil && !bytes.Equal(prevHash, first.Header.Parent) {
 							fetchErr = ErrReorg
 						}
@@ -622,10 +651,14 @@ func (rs *RepairService) reindexBlocks(ctx context.Context, task *Task, url stri
 				// Get previous block hash for reorg detection
 				var prevHash []byte
 				if blockNum > 0 {
-					prevHash, fetchErr = task.src.Hash(ctx, url, blockNum-1)
-					if fetchErr != nil {
-						pgtx.Rollback(ctx)
-						return totalReprocessed, fmt.Errorf("getting prev hash for %d: %w", blockNum-1, fetchErr)
+					if hasStoredPrev {
+						prevHash = storedPrevHash
+					} else {
+						prevHash, fetchErr = task.src.Hash(ctx, url, blockNum-1)
+						if fetchErr != nil {
+							pgtx.Rollback(ctx)
+							return totalReprocessed, fmt.Errorf("getting prev hash for %d: %w", blockNum-1, fetchErr)
+						}
 					}
 				}
 				parsedURL, _ := neturl.Parse(url)
