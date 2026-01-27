@@ -101,6 +101,30 @@ func TestReceiptValidator_FetchReceiptHash_Disabled(t *testing.T) {
 	}
 }
 
+func TestFilterBlocksForReceiptValidation(t *testing.T) {
+	addr1 := eth.Bytes{0x01}
+	addr2 := eth.Bytes{0x02}
+	addressFilter := []string{eth.EncodeHex(addr1)}
+
+	makeBlocks := func() []eth.Block {
+		l1 := eth.Log{BlockNumber: eth.Uint64(1), Idx: 1, Address: addr1}
+		l2 := eth.Log{BlockNumber: eth.Uint64(1), Idx: 2, Address: addr2}
+		return []eth.Block{{Txs: eth.Txs{{Receipt: eth.Receipt{Logs: eth.Logs{l1, l2}}}}}}
+	}
+
+	filter := glf.New([]string{"log_addr"}, addressFilter, nil)
+	filtered := filterBlocksForReceiptValidation(makeBlocks(), filter)
+	if got := len(filtered[0].Txs[0].Logs); got != 1 {
+		t.Fatalf("expected 1 log with UseReceipts=false, got %d", got)
+	}
+
+	filter.UseReceipts = true
+	unfiltered := filterBlocksForReceiptValidation(makeBlocks(), filter)
+	if got := len(unfiltered[0].Txs[0].Logs); got != 2 {
+		t.Fatalf("expected 2 logs with UseReceipts=true, got %d", got)
+	}
+}
+
 // TestValidateReceipts_MetricsIncrement verifies that metrics are incremented
 // on mismatch when a Metrics instance is provided.
 func TestValidateReceipts_MetricsIncrement(t *testing.T) {

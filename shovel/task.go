@@ -1271,8 +1271,14 @@ func loadTasks(ctx context.Context, pgp *pgxpool.Pool, c config.Root) ([]*Task, 
 				}
 			}
 			var rv *ReceiptValidator
-			if sc.ReceiptVerifier.Enabled {
+			if sc.ReceiptVerifier.Enabled && len(ig.Event.Selected()) > 0 {
 				rv = NewReceiptValidator(jrpc2.New(sc.ReceiptVerifier.Provider), true, NewMetrics(sc.Name, ig.Name))
+			} else if sc.ReceiptVerifier.Enabled {
+				slog.WarnContext(ctx, "receipt-validation-disabled",
+					"source", sc.Name,
+					"integration", ig.Name,
+					"warning", "Receipt validation disabled because integration has no event selector.",
+				)
 			}
 			task, err := NewTask(
 				WithContext(ctx),

@@ -52,7 +52,7 @@ func (rv *ReceiptValidator) FetchReceiptHash(ctx context.Context, filter *glf.Fi
 		return nil
 	}
 
-	blocks = filterBlocksByLogFilter(blocks, filter)
+	blocks = filterBlocksForReceiptValidation(blocks, filter)
 
 	// Use same hash computation as consensus for consistency
 	if len(blocks) == 0 {
@@ -107,7 +107,7 @@ func (rv *ReceiptValidator) Validate(ctx context.Context, filter *glf.Filter, bl
 		return fmt.Errorf("fetching receipts: %w", err)
 	}
 
-	blocks = filterBlocksByLogFilter(blocks, filter)
+	blocks = filterBlocksForReceiptValidation(blocks, filter)
 
 	if err := validateReceipts(blocks, consensusHash, blockNum, rv.metrics); err != nil {
 		return err
@@ -130,6 +130,16 @@ func receiptValidationFilter(filter *glf.Filter) glf.Filter {
 	receiptFilter.UseHeaders = false
 	receiptFilter.UseTraces = false
 	return receiptFilter
+}
+
+func filterBlocksForReceiptValidation(blocks []eth.Block, filter *glf.Filter) []eth.Block {
+	if filter == nil {
+		return blocks
+	}
+	if filter.UseReceipts {
+		return blocks
+	}
+	return filterBlocksByLogFilter(blocks, filter)
 }
 
 func filterBlocksByLogFilter(blocks []eth.Block, filter *glf.Filter) []eth.Block {
