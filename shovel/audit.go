@@ -17,11 +17,13 @@ import (
 )
 
 type Auditor struct {
-	pgp      *pgxpool.Pool
-	conf     config.Root
-	sources  map[string][]*jrpc2.Client
-	tasks    []*Task
-	interval time.Duration
+	pgp       *pgxpool.Pool
+	conf      config.Root
+	sources   map[string][]*jrpc2.Client
+	tasks     []*Task
+	interval  time.Duration
+	intervals map[string]time.Duration
+	nextAudit map[string]time.Time
 
 	// inFlight tracks the number of active audit verifications. It uses the
 	// same atomic increment/decrement pattern as Task.insert's nrows counter
@@ -32,10 +34,12 @@ type Auditor struct {
 
 func NewAuditor(pgp *pgxpool.Pool, conf config.Root, tasks []*Task) *Auditor {
 	a := &Auditor{
-		pgp:     pgp,
-		conf:    conf,
-		tasks:   tasks,
-		sources: make(map[string][]*jrpc2.Client),
+		pgp:       pgp,
+		conf:      conf,
+		tasks:     tasks,
+		sources:   make(map[string][]*jrpc2.Client),
+		intervals: make(map[string]time.Duration),
+		nextAudit: make(map[string]time.Time),
 	}
 	for _, sc := range conf.Sources {
 		var clients []*jrpc2.Client
@@ -44,8 +48,13 @@ func NewAuditor(pgp *pgxpool.Pool, conf config.Root, tasks []*Task) *Auditor {
 		}
 		a.sources[sc.Name] = clients
 		if sc.Audit.Enabled {
-			if a.interval == 0 || sc.Audit.CheckInterval < a.interval {
-				a.interval = sc.Audit.CheckInterval
+			interval := sc.Audit.CheckInterval
+			if interval <= 0 {
+				interval = defaultAuditInterval
+			}
+			a.intervals[sc.Name] = interval
+			if a.interval == 0 || interval < a.interval {
+				a.interval = interval
 			}
 			// Derive a simple global backpressure limit from per-source
 			// parallelism. This mirrors how Task.insert uses batchSize and
@@ -58,7 +67,7 @@ func NewAuditor(pgp *pgxpool.Pool, conf config.Root, tasks []*Task) *Auditor {
 		}
 	}
 	if a.interval == 0 {
-		a.interval = 5 * time.Second
+		a.interval = defaultAuditInterval
 	}
 	if a.maxInFlight == 0 {
 		// Fallback bound if all sources disabled; small, similar to a single
@@ -90,6 +99,8 @@ type auditTask struct {
 	consensusHash []byte
 }
 
+const defaultAuditInterval = 5 * time.Second
+
 const maxAuditRetries = 10
 
 func (a *Auditor) check(ctx context.Context) error {
@@ -97,10 +108,23 @@ func (a *Auditor) check(ctx context.Context) error {
 	if atomic.LoadInt64(&a.inFlight) >= a.maxInFlight {
 		return nil
 	}
+	now := time.Now()
 	for _, sc := range a.conf.Sources {
 		if !sc.Audit.Enabled {
 			continue
 		}
+		interval := a.intervals[sc.Name]
+		if interval <= 0 {
+			interval = sc.Audit.CheckInterval
+			if interval <= 0 {
+				interval = defaultAuditInterval
+			}
+		}
+		next := a.nextAudit[sc.Name]
+		if !next.IsZero() && now.Before(next) {
+			continue
+		}
+		a.nextAudit[sc.Name] = now.Add(interval)
 		// Query total pending count for accurate queue metric
 		const countQ = `
 			SELECT COUNT(*)
@@ -196,6 +220,31 @@ func (a *Auditor) check(ctx context.Context) error {
 }
 
 func (a *Auditor) verify(ctx context.Context, sc config.Source, t auditTask) error {
+	var (
+		started   bool
+		finalized bool
+	)
+	defer func() {
+		if !started || finalized || ctx.Err() == nil {
+			return
+		}
+		const reset = `
+			UPDATE shovel.block_verification
+			SET audit_status = 'pending'
+			WHERE src_name = $1 AND ig_name = $2 AND block_num = $3
+			  AND audit_status = 'verifying'
+		`
+		resetCtx := context.WithoutCancel(ctx)
+		if _, err := a.pgp.Exec(resetCtx, reset, t.srcName, t.igName, t.blockNum); err != nil {
+			slog.WarnContext(resetCtx, "resetting cancelled audit",
+				"src", t.srcName,
+				"ig", t.igName,
+				"block", t.blockNum,
+				"error", err,
+			)
+		}
+	}()
+
 	// Mark as verifying at start of audit attempt
 	const startVerify = `
 		UPDATE shovel.block_verification
@@ -206,6 +255,7 @@ func (a *Auditor) verify(ctx context.Context, sc config.Source, t auditTask) err
 	if _, err := a.pgp.Exec(ctx, startVerify, t.srcName, t.igName, t.blockNum); err != nil {
 		return fmt.Errorf("marking audit as verifying: %w", err)
 	}
+	started = true
 
 	// Find the task to get filter
 	var task *Task
@@ -322,6 +372,9 @@ func (a *Auditor) verify(ctx context.Context, sc config.Source, t auditTask) err
 			WHERE src_name = $1 AND ig_name = $2 AND block_num = $3
 		`
 		_, err := a.pgp.Exec(ctx, u, t.srcName, t.igName, t.blockNum)
+		if err == nil {
+			finalized = true
+		}
 		return err
 	}
 
@@ -374,6 +427,7 @@ func (a *Auditor) verify(ctx context.Context, sc config.Source, t auditTask) err
 		if err := tx.Commit(ctx); err != nil {
 			return fmt.Errorf("committing failed status: %w", err)
 		}
+		finalized = true
 		return nil
 	}
 
@@ -395,6 +449,7 @@ func (a *Auditor) verify(ctx context.Context, sc config.Source, t auditTask) err
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("committing delete tx: %w", err)
 	}
+	finalized = true
 
 	return nil
 }

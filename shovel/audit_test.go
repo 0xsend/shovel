@@ -3,6 +3,7 @@ package shovel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -156,11 +157,11 @@ func TestAuditor_VerifyMatch(t *testing.T) {
 	tc.NoErr(t, err)
 
 	if err := aud.verify(ctx, sc, auditTask{
-			srcName:       sc.Name,
-			igName:        task.destConfig.Name,
-			blockNum:      blockNum,
-			consensusHash: consensusHash,
-		}); err != nil {
+		srcName:       sc.Name,
+		igName:        task.destConfig.Name,
+		blockNum:      blockNum,
+		consensusHash: consensusHash,
+	}); err != nil {
 		t.Fatalf("verify returned error: %v", err)
 	}
 
@@ -201,11 +202,11 @@ func TestAuditor_VerifyMismatch(t *testing.T) {
 	tc.NoErr(t, err)
 
 	if err := aud.verify(ctx, sc, auditTask{
-			srcName:       sc.Name,
-			igName:        task.destConfig.Name,
-			blockNum:      blockNum,
-			consensusHash: mismatch,
-		}); err != nil {
+		srcName:       sc.Name,
+		igName:        task.destConfig.Name,
+		blockNum:      blockNum,
+		consensusHash: mismatch,
+	}); err != nil {
 		t.Fatalf("verify returned error: %v", err)
 	}
 
@@ -232,6 +233,133 @@ func TestAuditor_VerifyMismatch(t *testing.T) {
 	tc.WantGot(t, 0, remaining)
 }
 
+// TestAuditor_VerifyCancelReset ensures a cancelled audit does not leave rows
+// stuck in verifying.
+func TestAuditor_VerifyCancelReset(t *testing.T) {
+	ctx := context.Background()
+	pg := testpg(t)
+
+	const (
+		srcName = "cancel-src"
+		igName  = "cancel-ig"
+	)
+
+	blockBody := readJSON(t, "../jrpc2/testdata/block-1000001.json")
+	logsBody := readJSON(t, "../jrpc2/testdata/logs-1000001.json")
+	release := make(chan struct{})
+	blocking := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("reading request body: %v", err)
+		}
+		<-release
+		switch {
+		case methodsMatch(t, body, "eth_getBlockByNumber"):
+			if _, err := w.Write(blockBody); err != nil {
+				t.Fatalf("writing block response: %v", err)
+			}
+		case methodsMatch(t, body, "eth_getBlockByNumber", "eth_getLogs"):
+			if _, err := w.Write(logsBody); err != nil {
+				t.Fatalf("writing logs response: %v", err)
+			}
+		default:
+			t.Fatalf("unexpected RPC methods in body: %s", string(body))
+		}
+	}))
+	t.Cleanup(blocking.Close)
+
+	dest := newTestDestination(igName)
+	tg := &testGeth{}
+	task, err := NewTask(
+		WithContext(ctx),
+		WithPG(pg),
+		WithSource(tg),
+		WithIntegration(dest.ig()),
+		WithIntegrationFactory(dest.factory),
+		WithSrcName(srcName),
+		WithChainID(1),
+	)
+	tc.NoErr(t, err)
+
+	sc := config.Source{
+		Name:    srcName,
+		ChainID: 1,
+		URLs:    []string{blocking.URL},
+		Audit: config.Audit{
+			ProvidersPerBlock: 1,
+			Confirmations:     0,
+			Parallelism:       1,
+			CheckInterval:     0,
+			Enabled:           true,
+		},
+	}
+
+	conf := config.Root{Sources: []config.Source{sc}}
+	aud := NewAuditor(pg, conf, []*Task{task})
+
+	const blockNum = 1000001
+	_, err = aud.pgp.Exec(ctx, `
+		insert into shovel.block_verification (src_name, ig_name, block_num, consensus_hash, audit_status)
+		values ($1, $2, $3, $4, 'pending')
+	`, sc.Name, task.destConfig.Name, blockNum, []byte("hash"))
+	tc.NoErr(t, err)
+
+	verifyCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() {
+		done <- aud.verify(verifyCtx, sc, auditTask{
+			srcName:       sc.Name,
+			igName:        task.destConfig.Name,
+			blockNum:      blockNum,
+			consensusHash: []byte("hash"),
+		})
+	}()
+
+	waitCtx, waitCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer waitCancel()
+	for {
+		var status string
+		err := aud.pgp.QueryRow(waitCtx, `
+			select audit_status
+			from shovel.block_verification
+			where src_name = $1 and ig_name = $2 and block_num = $3
+		`, sc.Name, task.destConfig.Name, blockNum).Scan(&status)
+		tc.NoErr(t, err)
+		if status == "verifying" {
+			break
+		}
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf("timed out waiting for verifying status: %v", waitCtx.Err())
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	close(release)
+
+	select {
+	case err := <-done:
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context cancellation error, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("verify did not exit after cancellation")
+	}
+
+	var status string
+	var retryCount int
+	err = aud.pgp.QueryRow(ctx, `
+		select audit_status, retry_count
+		from shovel.block_verification
+		where src_name = $1 and ig_name = $2 and block_num = $3
+	`, sc.Name, task.destConfig.Name, blockNum).Scan(&status, &retryCount)
+	tc.NoErr(t, err)
+	tc.WantGot(t, "pending", status)
+	tc.WantGot(t, 0, retryCount)
+}
+
 // TestAuditor_MaxRetries verifies that once retry_count reaches the
 // maxAuditRetries limit, the auditor marks the row as failed and does not
 // delete local task_updates (i.e., no further reindex attempts are scheduled).
@@ -253,11 +381,11 @@ func TestAuditor_MaxRetries(t *testing.T) {
 	tc.NoErr(t, err)
 
 	if err := aud.verify(ctx, sc, auditTask{
-			srcName:       sc.Name,
-			igName:        task.destConfig.Name,
-			blockNum:      blockNum,
-			consensusHash: []byte("any"),
-		}); err != nil {
+		srcName:       sc.Name,
+		igName:        task.destConfig.Name,
+		blockNum:      blockNum,
+		consensusHash: []byte("any"),
+	}); err != nil {
 		t.Fatalf("verify returned error: %v", err)
 	}
 
@@ -341,7 +469,7 @@ func TestAuditor_VerifyTaskNotFound(t *testing.T) {
 	// Create auditor with no tasks
 	conf := config.Root{
 		Sources: []config.Source{{
-			Name: "test-src",
+			Name:  "test-src",
 			Audit: config.Audit{Enabled: true, ProvidersPerBlock: 1},
 		}},
 	}
@@ -377,6 +505,45 @@ func TestAuditor_CheckEmptyQueue(t *testing.T) {
 	// No block_verification rows exist, check() should return without error
 	err := aud.check(ctx)
 	tc.NoErr(t, err)
+}
+
+// TestAuditor_CheckIntervalPerSource ensures per-source intervals are respected.
+func TestAuditor_CheckIntervalPerSource(t *testing.T) {
+	ctx := context.Background()
+	pg := testpg(t)
+
+	fast := config.Source{
+		Name: "fast-src",
+		Audit: config.Audit{
+			Enabled:       true,
+			CheckInterval: 10 * time.Millisecond,
+		},
+	}
+	slow := config.Source{
+		Name: "slow-src",
+		Audit: config.Audit{
+			Enabled:       true,
+			CheckInterval: 200 * time.Millisecond,
+		},
+	}
+
+	conf := config.Root{Sources: []config.Source{fast, slow}}
+	aud := NewAuditor(pg, conf, []*Task{})
+
+	now := time.Now()
+	future := now.Add(200 * time.Millisecond)
+	aud.nextAudit[fast.Name] = now.Add(-time.Millisecond)
+	aud.nextAudit[slow.Name] = future
+
+	err := aud.check(ctx)
+	tc.NoErr(t, err)
+
+	if !aud.nextAudit[slow.Name].Equal(future) {
+		t.Fatalf("expected slow source next audit to remain %v, got %v", future, aud.nextAudit[slow.Name])
+	}
+	if !aud.nextAudit[fast.Name].After(now) {
+		t.Fatalf("expected fast source next audit to advance, got %v", aud.nextAudit[fast.Name])
+	}
 }
 
 // TestAuditor_EscalationThresholdConsensus tests the escalation threshold logic
