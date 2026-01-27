@@ -716,6 +716,80 @@ func (rs *RepairService) reindexBlocks(ctx context.Context, task *Task, url stri
 			return totalReprocessed, fmt.Errorf("updating task_updates: %w", err)
 		}
 
+		// Recreate block_verification rows so the auditor re-verifies
+		// repaired blocks. Mirrors the verification insertion in
+		// Task.Converge (task.go).
+		if task.consensus != nil {
+			const verifyQ = `
+				insert into shovel.block_verification (
+					src_name, ig_name, block_num,
+					consensus_hash, receipt_hash,
+					audit_status, provider_set, created_at
+				) values ($1, $2, $3, $4, $5, 'pending', $6, now())
+				on conflict (src_name, ig_name, block_num)
+				do update set
+					consensus_hash = excluded.consensus_hash,
+					receipt_hash = excluded.receipt_hash,
+					provider_set = excluded.provider_set,
+					audit_status = CASE
+						WHEN shovel.block_verification.audit_status IN ('failed', 'receipt_unverified', 'retrying')
+						THEN 'pending'
+						ELSE shovel.block_verification.audit_status
+					END
+			`
+			providerSet := make([]string, len(task.consensus.providers))
+			for i := range task.consensus.providers {
+				providerSet[i] = task.consensus.providers[i].NextURL().String()
+			}
+			providerSetJSON, err := json.Marshal(providerSet)
+			if err != nil {
+				pgtx.Rollback(ctx)
+				return totalReprocessed, fmt.Errorf("marshaling provider set: %w", err)
+			}
+			for _, b := range blocks {
+				blockHash := HashBlocks([]eth.Block{b})
+				var receiptHash []byte
+				if task.receiptValidator != nil && task.receiptValidator.Enabled() {
+					receiptHash = task.receiptValidator.FetchReceiptHash(ctx, &task.filter, b.Num())
+				}
+				if _, err := pgtx.Exec(ctx, verifyQ,
+					task.srcName, task.destConfig.Name, b.Num(),
+					blockHash, receiptHash, providerSetJSON,
+				); err != nil {
+					pgtx.Rollback(ctx)
+					return totalReprocessed, fmt.Errorf("inserting block_verification: %w", err)
+				}
+			}
+		} else if task.receiptValidator != nil && task.receiptValidator.Enabled() {
+			const verifyQ = `
+				insert into shovel.block_verification (
+					src_name, ig_name, block_num,
+					consensus_hash, receipt_hash,
+					audit_status, created_at
+				) values ($1, $2, $3, $4, $5, 'pending', now())
+				on conflict (src_name, ig_name, block_num)
+				do update set
+					consensus_hash = excluded.consensus_hash,
+					receipt_hash = excluded.receipt_hash,
+					audit_status = CASE
+						WHEN shovel.block_verification.audit_status IN ('failed', 'receipt_unverified', 'retrying')
+						THEN 'pending'
+						ELSE shovel.block_verification.audit_status
+					END
+			`
+			for _, b := range blocks {
+				blockHash := HashBlocks([]eth.Block{b})
+				receiptHash := task.receiptValidator.FetchReceiptHash(ctx, &task.filter, b.Num())
+				if _, err := pgtx.Exec(ctx, verifyQ,
+					task.srcName, task.destConfig.Name, b.Num(),
+					blockHash, receiptHash,
+				); err != nil {
+					pgtx.Rollback(ctx)
+					return totalReprocessed, fmt.Errorf("inserting block_verification: %w", err)
+				}
+			}
+		}
+
 		if err := pgtx.Commit(ctx); err != nil {
 			return totalReprocessed, fmt.Errorf("committing batch %d-%d: %w", blockNum, batchEnd, err)
 		}
@@ -741,7 +815,11 @@ func (rs *RepairService) updateRepairStatus(ctx context.Context, repairID, statu
 		SET status = $1, errors = $2, completed_at = now()
 		WHERE repair_id = $3
 	`
-	if _, err := rs.pgp.Exec(ctx, q, status, errorsJSON, repairID); err != nil {
+	// Use a fresh context so the status write succeeds even when
+	// the repair's timeout context has been canceled.
+	writeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := rs.pgp.Exec(writeCtx, q, status, errorsJSON, repairID); err != nil {
 		slog.ErrorContext(ctx, "failed-to-update-repair-status",
 			"repair_id", repairID,
 			"status", status,
