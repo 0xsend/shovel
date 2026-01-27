@@ -174,9 +174,10 @@ func (ce *ConsensusEngine) FetchWithQuorum(ctx context.Context, filter *glf.Filt
 
 		// Compute hashes and count votes
 		var (
-			counts    = make(map[string]int)
-			canonHash string
-			canonIdx  int = -1
+			counts         = make(map[string]int)
+			canonHashHex   string
+			canonHashBytes []byte
+			canonIdx       int = -1
 		)
 		for i, blocks := range responses {
 			if errs[i] != nil {
@@ -186,7 +187,8 @@ func (ce *ConsensusEngine) FetchWithQuorum(ctx context.Context, filter *glf.Filt
 			s := hex.EncodeToString(h)
 			counts[s]++
 			if counts[s] >= conf.Threshold {
-				canonHash = s
+				canonHashHex = s
+				canonHashBytes = h
 				canonIdx = i
 				break
 			}
@@ -198,7 +200,7 @@ func (ce *ConsensusEngine) FetchWithQuorum(ctx context.Context, filter *glf.Filt
 				attribute.Int("consensus.attempts", attempt+1),
 				attribute.Int("consensus.active_providers", numProviders),
 				attribute.Int("blocks.returned", len(responses[canonIdx])),
-				attribute.String("consensus.hash", canonHash[:16]+"..."), // Truncate for readability
+				attribute.String("consensus.hash", canonHashHex[:16]+"..."), // Truncate for readability
 				attribute.Int64("duration_ms", elapsed.Milliseconds()),
 			)
 			slog.DebugContext(ctx, "consensus-reached",
@@ -209,7 +211,7 @@ func (ce *ConsensusEngine) FetchWithQuorum(ctx context.Context, filter *glf.Filt
 				"attempt", attempt+1,
 				"elapsed", elapsed,
 			)
-			return responses[canonIdx], []byte(canonHash), nil
+			return responses[canonIdx], canonHashBytes, nil
 		}
 
 		// Log failed providers for debugging
