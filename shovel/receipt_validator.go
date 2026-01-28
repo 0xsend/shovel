@@ -55,32 +55,14 @@ func (rv *ReceiptValidator) FetchReceiptHash(ctx context.Context, filter *glf.Fi
 	blocks = filterBlocksForReceiptValidation(blocks, filter)
 
 	// Use same hash computation as consensus for consistency
-	if len(blocks) == 0 {
-		return HashBlocksWithRange(nil, blockNum, 1)
-	}
-	return HashBlocks(blocks)
+	return HashBlocksWithRange(blocks, blockNum, 1)
 }
 
 // validateReceipts contains the core hash comparison logic for receipt validation.
 // It mirrors the helper-style validate() function in jrpc2/client.go, but is
 // specialized for comparing a consensus hash against blocks built from receipts.
 func validateReceipts(blocks []eth.Block, consensusHash []byte, blockNum uint64, metrics *Metrics) error {
-	// No blocks returned: treat as an "empty" range and compare against the
-	// canonical empty hash using HashBlocksWithRange to include block range metadata.
-	// This matches consensus.go hash computation for empty ranges.
-	if len(blocks) == 0 {
-		emptyHash := HashBlocksWithRange(nil, blockNum, 1)
-		if !bytes.Equal(emptyHash, consensusHash) {
-			if metrics != nil {
-				metrics.ReceiptMismatch()
-			}
-			return ErrReceiptMismatch
-		}
-		return nil
-	}
-
-	// Non-empty: hash all logs deterministically and compare.
-	hash := HashBlocks(blocks)
+	hash := HashBlocksWithRange(blocks, blockNum, 1)
 	if !bytes.Equal(hash, consensusHash) {
 		if metrics != nil {
 			metrics.ReceiptMismatch()
@@ -113,7 +95,7 @@ func (rv *ReceiptValidator) Validate(ctx context.Context, filter *glf.Filter, bl
 		return err
 	}
 
-	empty := len(blocks) == 0
+	empty := !blocksHaveLogs(blocks)
 	slog.DebugContext(ctx, "receipt-validation-success",
 		"block", blockNum,
 		"provider", url.String(),

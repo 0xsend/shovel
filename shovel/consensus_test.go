@@ -1064,6 +1064,29 @@ func TestHashBlocksWithRange_EmptyRanges(t *testing.T) {
 	}
 }
 
+func TestHashBlocksWithRange_EmptyLogsInBlocks(t *testing.T) {
+	blocks1 := []eth.Block{
+		{Header: eth.Header{Number: eth.Uint64(100)}},
+		{Header: eth.Header{Number: eth.Uint64(101)}},
+	}
+	blocks2 := []eth.Block{
+		{Header: eth.Header{Number: eth.Uint64(200)}},
+		{Header: eth.Header{Number: eth.Uint64(201)}},
+	}
+
+	h1 := HashBlocksWithRange(blocks1, 100, 2)
+	h2 := HashBlocksWithRange(blocks2, 200, 2)
+	h3 := HashBlocksWithRange(blocks1, 100, 2)
+
+	if bytes.Equal(h1, h2) {
+		t.Error("different empty-log ranges should produce different hashes")
+	}
+
+	if !bytes.Equal(h1, h3) {
+		t.Error("same empty-log range should produce same hash")
+	}
+}
+
 // TestConsensus_ReconcilesWithMockProviders tests end-to-end reconciliation
 // when providers disagree (1 faulty, 2 correct) using only mock RPC servers.
 //

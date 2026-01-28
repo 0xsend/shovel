@@ -247,13 +247,24 @@ func (ce *ConsensusEngine) FetchWithQuorum(ctx context.Context, filter *glf.Filt
 }
 
 // HashBlocksWithRange computes a deterministic hash of the logs in the blocks,
-// and for empty ranges includes the requested block range so distinct empty
-// ranges do not collide.
+// and for ranges with no logs includes the requested block range so distinct
+// empty ranges do not collide.
 func HashBlocksWithRange(blocks []eth.Block, start, limit uint64) []byte {
-	if len(blocks) == 0 {
+	if len(blocks) == 0 || !blocksHaveLogs(blocks) {
 		return eth.Keccak([]byte(fmt.Sprintf("empty-range-%d-%d", start, limit)))
 	}
 	return HashBlocks(blocks)
+}
+
+func blocksHaveLogs(blocks []eth.Block) bool {
+	for i := range blocks {
+		for j := range blocks[i].Txs {
+			if len(blocks[i].Txs[j].Logs) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // HashBlocks computes a deterministic hash of the logs in the blocks.
