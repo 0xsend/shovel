@@ -204,7 +204,8 @@ func (h *Handler) Prom(w http.ResponseWriter, r *http.Request) {
 	// corrupts the response when promhttp applies gzip encoding.
 	scs, err := h.conf.AllSources(r.Context(), h.pgp)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.WarnContext(r.Context(), "metrics-sources-error", "error", err)
+		promhttp.Handler().ServeHTTP(w, r)
 		return
 	}
 	for _, sc := range scs {

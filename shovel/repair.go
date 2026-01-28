@@ -572,6 +572,9 @@ func (rs *RepairService) reindexBlocks(ctx context.Context, task *Task, url stri
 
 	// Process in batches to avoid overwhelming memory and transactions
 	batchSize := uint64(task.batchSize)
+	if batchSize == 0 {
+		batchSize = 1
+	}
 	for blockNum := start; blockNum <= end; blockNum += batchSize {
 		batchEnd := blockNum + batchSize - 1
 		if batchEnd > end {
@@ -639,7 +642,25 @@ func (rs *RepairService) reindexBlocks(ctx context.Context, task *Task, url stri
 							prevHash, fetchErr = task.src.Hash(ctx, hashURL, blockNum-1)
 						}
 						if fetchErr == nil && !bytes.Equal(prevHash, first.Header.Parent) {
-							fetchErr = ErrReorg
+							if hasStoredPrev {
+								hashURL := task.src.NextURL().String()
+								confirmedPrev, err := task.src.Hash(ctx, hashURL, blockNum-1)
+								if err != nil {
+									fetchErr = fmt.Errorf("getting prev hash for %d: %w", blockNum-1, err)
+								} else if bytes.Equal(confirmedPrev, first.Header.Parent) {
+									slog.WarnContext(ctx, "repair-prev-hash-stale",
+										"block", blockNum-1,
+										"source", task.srcName,
+										"integration", task.destConfig.Name,
+									)
+									storedPrevHash = confirmedPrev
+									hasStoredPrev = true
+								} else {
+									fetchErr = ErrReorg
+								}
+							} else {
+								fetchErr = ErrReorg
+							}
 						}
 					}
 				}
@@ -651,11 +672,18 @@ func (rs *RepairService) reindexBlocks(ctx context.Context, task *Task, url stri
 				// Get previous block hash for reorg detection
 				var prevHash []byte
 				if blockNum > 0 {
-					if hasStoredPrev {
-						prevHash = storedPrevHash
-					} else {
-						prevHash, fetchErr = task.src.Hash(ctx, url, blockNum-1)
-						if fetchErr != nil {
+					prevHash, fetchErr = task.src.Hash(ctx, url, blockNum-1)
+					if fetchErr != nil {
+						if hasStoredPrev {
+							slog.WarnContext(ctx, "repair-prev-hash-fallback",
+								"block", blockNum-1,
+								"source", task.srcName,
+								"integration", task.destConfig.Name,
+								"error", fetchErr,
+							)
+							prevHash = storedPrevHash
+							fetchErr = nil
+						} else {
 							pgtx.Rollback(ctx)
 							return totalReprocessed, fmt.Errorf("getting prev hash for %d: %w", blockNum-1, fetchErr)
 						}
