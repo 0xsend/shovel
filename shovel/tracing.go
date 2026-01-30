@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	neturl "net/url"
 	"os"
 
 	"go.opentelemetry.io/otel"
@@ -84,6 +85,9 @@ var meterProvider *sdkmetric.MeterProvider
 //	defer shutdown(ctx)
 func InitTracing(ctx context.Context, cfg TracingConfig) (func(context.Context) error, error) {
 	if !cfg.Enabled {
+		slog.Info("tracing-disabled",
+			"hint", "set OTEL_ENABLED=true and OTEL_EXPORTER_OTLP_ENDPOINT to enable",
+		)
 		// Return no-op tracer and shutdown
 		Tracer = otel.Tracer("shovel")
 		Meter = otel.Meter("shovel")
@@ -127,24 +131,39 @@ func InitTracing(ctx context.Context, cfg TracingConfig) (func(context.Context) 
 		return nil, fmt.Errorf("creating resource: %w", err)
 	}
 
+	// WithEndpoint expects host:port, not a full URL. Parse the endpoint
+	// to extract host:port and detect the scheme for TLS configuration.
+	// This allows OTEL_EXPORTER_OTLP_ENDPOINT to be a full URL like
+	// "http://jaeger:4318" per the OTel spec.
+	endpoint := cfg.Endpoint
+	insecure := cfg.Insecure
+	if endpoint != "" {
+		if u, parseErr := neturl.Parse(endpoint); parseErr == nil && u.Host != "" {
+			endpoint = u.Host
+			if u.Scheme == "http" {
+				insecure = true
+			}
+		}
+	}
+
 	// Create exporter based on protocol
 	var exporter sdktrace.SpanExporter
 	switch cfg.Protocol {
 	case "grpc":
 		opts := []otlptracegrpc.Option{}
-		if cfg.Endpoint != "" {
-			opts = append(opts, otlptracegrpc.WithEndpoint(cfg.Endpoint))
+		if endpoint != "" {
+			opts = append(opts, otlptracegrpc.WithEndpoint(endpoint))
 		}
-		if cfg.Insecure {
+		if insecure {
 			opts = append(opts, otlptracegrpc.WithInsecure())
 		}
 		exporter, err = otlptracegrpc.New(ctx, opts...)
 	case "http":
 		opts := []otlptracehttp.Option{}
-		if cfg.Endpoint != "" {
-			opts = append(opts, otlptracehttp.WithEndpoint(cfg.Endpoint))
+		if endpoint != "" {
+			opts = append(opts, otlptracehttp.WithEndpoint(endpoint))
 		}
-		if cfg.Insecure {
+		if insecure {
 			opts = append(opts, otlptracehttp.WithInsecure())
 		}
 		exporter, err = otlptracehttp.New(ctx, opts...)
