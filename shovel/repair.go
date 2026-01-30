@@ -672,18 +672,11 @@ func (rs *RepairService) reindexBlocks(ctx context.Context, task *Task, url stri
 				// Get previous block hash for reorg detection
 				var prevHash []byte
 				if blockNum > 0 {
-					prevHash, fetchErr = task.src.Hash(ctx, url, blockNum-1)
-					if fetchErr != nil {
-						if hasStoredPrev {
-							slog.WarnContext(ctx, "repair-prev-hash-fallback",
-								"block", blockNum-1,
-								"source", task.srcName,
-								"integration", task.destConfig.Name,
-								"error", fetchErr,
-							)
-							prevHash = storedPrevHash
-							fetchErr = nil
-						} else {
+					if hasStoredPrev {
+						prevHash = storedPrevHash
+					} else {
+						prevHash, fetchErr = task.src.Hash(ctx, url, blockNum-1)
+						if fetchErr != nil {
 							pgtx.Rollback(ctx)
 							return totalReprocessed, fmt.Errorf("getting prev hash for %d: %w", blockNum-1, fetchErr)
 						}
