@@ -846,15 +846,18 @@ func (task *Task) Converge() error {
 			int64(delta),
 			metric.WithAttributes(metricAttrs...),
 		)
-		slog.InfoContext(ctx, "converge",
-			"trace_id", trace.SpanFromContext(ctx).SpanContext().TraceID(),
+		convergeAttrs := []any{
 			"n", last.Num(),
 			"h", fmt.Sprintf("%.4x", last.Hash()),
 			"nrows", nrows,
 			"nrpc", wctx.Counter(ctx),
 			"nblocks", delta,
 			"elapsed", time.Since(t0),
-		)
+		}
+		if tid := trace.SpanFromContext(ctx).SpanContext().TraceID(); tid.IsValid() {
+			convergeAttrs = append(convergeAttrs, "trace_id", tid)
+		}
+		slog.InfoContext(ctx, "converge", convergeAttrs...)
 		return nil
 	}
 	recordSpanError(span, ErrReorg, "reorg limit exceeded")
