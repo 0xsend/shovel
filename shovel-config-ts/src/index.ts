@@ -163,6 +163,51 @@ export type Consensus = {
 };
 
 /**
+ * Receipt verifier configuration for independent validation.
+ */
+export type ReceiptVerifier = {
+  /**
+   * RPC provider URL for fetching receipts.
+   * Must be different from consensus providers.
+   */
+  provider: EnvRef | string;
+  /**
+   * Enable receipt verification.
+   */
+  enabled: boolean;
+};
+
+/**
+ * Audit configuration for post-confirmation verification.
+ */
+export type Audit = {
+  /**
+   * Enable the audit loop.
+   */
+  enabled: boolean;
+  /**
+   * Number of confirmations before auditing a block.
+   * Defaults to 128 if not specified.
+   */
+  confirmations?: EnvRef | number;
+  /**
+   * Interval between audit checks.
+   * Defaults to "5s" if not specified.
+   */
+  check_interval?: EnvRef | string;
+  /**
+   * Number of providers to query per audit.
+   * Defaults to 2 if not specified.
+   */
+  providers_per_block?: EnvRef | number;
+  /**
+   * Maximum concurrent audit operations.
+   * Defaults to 4 if not specified.
+   */
+  parallelism?: EnvRef | number;
+};
+
+/**
  * Source represents an Ethereum HTTP JSON RPC API Provider.
  */
 export type Source = {
@@ -185,6 +230,18 @@ export type Source = {
    * agreement before accepting data.
    */
   consensus?: Consensus;
+  /**
+   * Receipt verifier configuration for independent validation.
+   * When enabled, shovel will fetch receipts from an independent provider
+   * and compare the hash against consensus results.
+   */
+  receipt_verifier?: ReceiptVerifier;
+  /**
+   * Audit configuration for post-confirmation verification.
+   * When enabled, shovel will re-verify blocks after they have
+   * sufficient confirmations.
+   */
+  audit?: Audit;
 };
 
 export type SourceReference = {
