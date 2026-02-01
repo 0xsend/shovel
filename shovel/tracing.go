@@ -1,0 +1,320 @@
+package shovel
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	neturl "net/url"
+	"os"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// TracingConfig holds configuration for OpenTelemetry tracing.
+type TracingConfig struct {
+	// Enabled controls whether tracing is active.
+	Enabled bool
+
+	// Endpoint is the OTEL collector endpoint (e.g., "otel-collector.monitoring:4317").
+	// If empty, uses OTEL_EXPORTER_OTLP_ENDPOINT env var.
+	Endpoint string
+
+	// Protocol is "grpc" or "http". Defaults to "grpc".
+	Protocol string
+
+	// ServiceName identifies this service in traces. Defaults to "shovel".
+	ServiceName string
+
+	// ServiceVersion is the version tag. Defaults to build version.
+	ServiceVersion string
+
+	// SampleRate is the fraction of traces to sample (0.0 to 1.0).
+	// Defaults to 1.0 (sample all). Set lower for high-throughput production.
+	SampleRate float64
+
+	// Insecure disables TLS for the exporter connection.
+	Insecure bool
+}
+
+// Tracer is the global tracer instance for Shovel.
+// Use this to create spans: ctx, span := Tracer.Start(ctx, "operation-name")
+// Initialized to a no-op tracer by default; call InitTracing to enable real tracing.
+var Tracer trace.Tracer = otel.Tracer("shovel")
+
+// Meter is the global meter instance for Shovel metrics.
+// Initialized to a no-op meter by default; call InitTracing to enable real metrics.
+var Meter metric.Meter = otel.Meter("shovel")
+
+// OTEL metric instruments.
+var (
+	ConvergeDuration metric.Float64Histogram
+	BlocksIndexed    metric.Int64Counter
+	ProviderLatency  metric.Float64Histogram
+)
+
+// tracerProvider holds the SDK tracer provider for shutdown.
+var tracerProvider *sdktrace.TracerProvider
+
+// meterProvider holds the SDK meter provider for shutdown.
+var meterProvider *sdkmetric.MeterProvider
+
+// InitTracing initializes OpenTelemetry tracing with the given configuration.
+// Returns a shutdown function that should be called on application exit.
+//
+// Example:
+//
+//	shutdown, err := InitTracing(ctx, TracingConfig{
+//	    Enabled:     true,
+//	    Endpoint:    "otel-collector.monitoring:4317",
+//	    ServiceName: "shovel",
+//	})
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	defer shutdown(ctx)
+func InitTracing(ctx context.Context, cfg TracingConfig) (func(context.Context) error, error) {
+	if !cfg.Enabled {
+		slog.Info("tracing-disabled",
+			"hint", "set OTEL_ENABLED=true and OTEL_EXPORTER_OTLP_ENDPOINT to enable",
+		)
+		// Return no-op tracer and shutdown
+		Tracer = otel.Tracer("shovel")
+		Meter = otel.Meter("shovel")
+		if err := initMetrics(Meter); err != nil {
+			return nil, err
+		}
+		return func(context.Context) error { return nil }, nil
+	}
+
+	// Apply defaults
+	if cfg.ServiceName == "" {
+		cfg.ServiceName = "shovel"
+	}
+	if cfg.ServiceVersion == "" {
+		cfg.ServiceVersion = "unknown"
+	}
+	if cfg.Protocol == "" {
+		cfg.Protocol = "grpc"
+	}
+	// Normalize http/protobuf to http (standard OTEL env value)
+	if cfg.Protocol == "http/protobuf" {
+		cfg.Protocol = "http"
+	}
+	// Only default to 1.0 if SampleRate was never set (negative).
+	// This allows explicit 0.0 sample rate while tracing is enabled.
+	if cfg.SampleRate < 0 {
+		cfg.SampleRate = 1.0
+	}
+
+	// Build resource with service information
+	res, err := resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName(cfg.ServiceName),
+			semconv.ServiceVersion(cfg.ServiceVersion),
+			attribute.String("service.namespace", "shovel"),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("creating resource: %w", err)
+	}
+
+	// WithEndpoint expects host:port, not a full URL. Parse the endpoint
+	// to extract host:port and detect the scheme for TLS configuration.
+	// This allows OTEL_EXPORTER_OTLP_ENDPOINT to be a full URL like
+	// "http://jaeger:4318" per the OTel spec.
+	endpoint := cfg.Endpoint
+	insecure := cfg.Insecure
+	if endpoint != "" {
+		if u, parseErr := neturl.Parse(endpoint); parseErr == nil && u.Host != "" {
+			endpoint = u.Host
+			if u.Scheme == "http" {
+				insecure = true
+			}
+		}
+	}
+
+	// Create exporter based on protocol
+	var exporter sdktrace.SpanExporter
+	switch cfg.Protocol {
+	case "grpc":
+		opts := []otlptracegrpc.Option{}
+		if endpoint != "" {
+			opts = append(opts, otlptracegrpc.WithEndpoint(endpoint))
+		}
+		if insecure {
+			opts = append(opts, otlptracegrpc.WithInsecure())
+		}
+		exporter, err = otlptracegrpc.New(ctx, opts...)
+	case "http":
+		opts := []otlptracehttp.Option{}
+		if endpoint != "" {
+			opts = append(opts, otlptracehttp.WithEndpoint(endpoint))
+		}
+		if insecure {
+			opts = append(opts, otlptracehttp.WithInsecure())
+		}
+		exporter, err = otlptracehttp.New(ctx, opts...)
+	default:
+		return nil, fmt.Errorf("unsupported protocol: %s (use 'grpc' or 'http')", cfg.Protocol)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("creating exporter: %w", err)
+	}
+
+	// Create sampler
+	sampler := sdktrace.ParentBased(
+		sdktrace.TraceIDRatioBased(cfg.SampleRate),
+		sdktrace.WithRemoteParentSampled(sdktrace.AlwaysSample()),
+	)
+
+	// Create tracer provider
+	tracerProvider = sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+		sdktrace.WithSampler(sampler),
+	)
+
+	// Set as global provider
+	otel.SetTracerProvider(tracerProvider)
+
+	// Set up propagation (W3C Trace Context)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
+	// Create named tracer
+	Tracer = tracerProvider.Tracer(cfg.ServiceName)
+
+	// Create meter provider and named meter
+	meterProvider = sdkmetric.NewMeterProvider(
+		sdkmetric.WithResource(res),
+	)
+	otel.SetMeterProvider(meterProvider)
+	Meter = meterProvider.Meter(cfg.ServiceName)
+	if err := initMetrics(Meter); err != nil {
+		return nil, err
+	}
+
+	slog.Info("tracing-initialized",
+		"endpoint", cfg.Endpoint,
+		"protocol", cfg.Protocol,
+		"sample_rate", cfg.SampleRate,
+	)
+
+	// Return shutdown function
+	return func(ctx context.Context) error {
+		slog.Info("tracing-shutdown")
+		var shutdownErr error
+		if tracerProvider != nil {
+			if err := tracerProvider.Shutdown(ctx); err != nil {
+				shutdownErr = err
+			}
+		}
+		if meterProvider != nil {
+			if err := meterProvider.Shutdown(ctx); err != nil && shutdownErr == nil {
+				shutdownErr = err
+			}
+		}
+		return shutdownErr
+	}, nil
+}
+
+// TracingConfigFromEnv creates a TracingConfig from environment variables.
+// Supported variables:
+//   - OTEL_ENABLED: "true" to enable tracing
+//   - OTEL_EXPORTER_OTLP_ENDPOINT: collector endpoint
+//   - OTEL_EXPORTER_OTLP_PROTOCOL: "grpc", "http", or "http/protobuf"
+//   - OTEL_SERVICE_NAME: service name (default: "shovel")
+//   - OTEL_TRACE_SAMPLE_RATE: sample rate 0.0-1.0 (default: 1.0)
+//   - OTEL_EXPORTER_OTLP_INSECURE: "true" to disable TLS
+func TracingConfigFromEnv() TracingConfig {
+	cfg := TracingConfig{
+		Enabled:     os.Getenv("OTEL_ENABLED") == "true",
+		Endpoint:    os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+		Protocol:    os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL"),
+		ServiceName: os.Getenv("OTEL_SERVICE_NAME"),
+		Insecure:    os.Getenv("OTEL_EXPORTER_OTLP_INSECURE") == "true",
+		SampleRate:  -1.0, // Sentinel: unset, will default to 1.0 in InitTracing
+	}
+
+	// Parse sample rate - allows explicit 0.0 to disable sampling while tracing enabled
+	if rate := os.Getenv("OTEL_TRACE_SAMPLE_RATE"); rate != "" {
+		var r float64
+		if _, err := fmt.Sscanf(rate, "%f", &r); err == nil && r >= 0 && r <= 1 {
+			cfg.SampleRate = r
+		}
+	}
+
+	return cfg
+}
+
+// SpanFromContext extracts the current span from context.
+// Returns a no-op span if none exists.
+func SpanFromContext(ctx context.Context) trace.Span {
+	return trace.SpanFromContext(ctx)
+}
+
+// WithSpanAttributes adds attributes to the current span in context.
+func WithSpanAttributes(ctx context.Context, attrs ...attribute.KeyValue) {
+	span := trace.SpanFromContext(ctx)
+	span.SetAttributes(attrs...)
+}
+
+func recordSpanError(span trace.Span, err error, msg string) {
+	if err == nil {
+		return
+	}
+	span.RecordError(err)
+	if msg == "" {
+		msg = err.Error()
+	}
+	span.SetStatus(codes.Error, msg)
+}
+
+func initMetrics(meter metric.Meter) error {
+	var err error
+	ConvergeDuration, err = meter.Float64Histogram(
+		"shovel_converge_duration_seconds",
+		metric.WithDescription("Duration of task convergence"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return fmt.Errorf("creating converge duration metric: %w", err)
+	}
+	BlocksIndexed, err = meter.Int64Counter(
+		"shovel_blocks_indexed_total",
+		metric.WithDescription("Total number of blocks indexed"),
+	)
+	if err != nil {
+		return fmt.Errorf("creating blocks indexed metric: %w", err)
+	}
+	ProviderLatency, err = meter.Float64Histogram(
+		"shovel_provider_latency_seconds",
+		metric.WithDescription("RPC provider latency"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return fmt.Errorf("creating provider latency metric: %w", err)
+	}
+	return nil
+}
+
+func init() {
+	if err := initMetrics(Meter); err != nil {
+		slog.Error("tracing-metrics-init", "error", err)
+	}
+}

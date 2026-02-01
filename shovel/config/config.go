@@ -332,15 +332,56 @@ type Dashboard struct {
 }
 
 type Source struct {
-	Name         string
-	ChainID      uint64
-	URLs         []string
-	WSURL        string
-	Start        uint64
-	Stop         uint64
-	PollDuration time.Duration
-	Concurrency  int
-	BatchSize    int
+	Name            string
+	ChainID         uint64
+	URLs            []string
+	WSURL           string
+	Start           uint64
+	Stop            uint64
+	PollDuration    time.Duration
+	Concurrency     int
+	BatchSize       int
+	Consensus       Consensus
+	ReceiptVerifier ReceiptVerifier
+	Audit           Audit
+}
+
+type Consensus struct {
+	Providers    int           `json:"providers"`
+	Threshold    int           `json:"threshold"`
+	RetryBackoff time.Duration `json:"retry_backoff"`
+	MaxBackoff   time.Duration `json:"max_backoff"`
+	MaxAttempts  int           `json:"max_attempts"` // Max retry attempts before giving up (default: 1000)
+}
+
+// Validate checks that Consensus configuration is valid
+func (c *Consensus) Validate() error {
+	if c.Threshold < 1 {
+		return fmt.Errorf("threshold must be >= 1, got %d", c.Threshold)
+	}
+	if c.Providers < c.Threshold {
+		return fmt.Errorf("providers (%d) must be >= threshold (%d)", c.Providers, c.Threshold)
+	}
+	if c.RetryBackoff < 0 {
+		return fmt.Errorf("retry_backoff must be non-negative")
+	}
+	if c.MaxBackoff < c.RetryBackoff {
+		return fmt.Errorf("max_backoff must be >= retry_backoff")
+	}
+	return nil
+}
+
+type ReceiptVerifier struct {
+	Provider string `json:"provider"`
+	Enabled  bool   `json:"enabled"`
+}
+
+type Audit struct {
+	ProvidersPerBlock int           `json:"providers_per_block"`
+	Confirmations     uint64        `json:"confirmations"`
+	Parallelism       int           `json:"parallelism"`
+	CheckInterval     time.Duration `json:"check_interval"`
+	Enabled           bool          `json:"enabled"`
 }
 
 func (s *Source) UnmarshalJSON(d []byte) error {
@@ -355,6 +396,24 @@ func (s *Source) UnmarshalJSON(d []byte) error {
 		PollDuration wos.EnvString   `json:"poll_duration"`
 		Concurrency  wos.EnvInt      `json:"concurrency"`
 		BatchSize    wos.EnvInt      `json:"batch_size"`
+		Consensus    struct {
+			Providers    wos.EnvInt    `json:"providers"`
+			Threshold    wos.EnvInt    `json:"threshold"`
+			RetryBackoff wos.EnvString `json:"retry_backoff"`
+			MaxBackoff   wos.EnvString `json:"max_backoff"`
+			MaxAttempts  wos.EnvInt    `json:"max_attempts"`
+		} `json:"consensus"`
+		ReceiptVerifier struct {
+			Provider wos.EnvString `json:"provider"`
+			Enabled  bool          `json:"enabled"`
+		} `json:"receipt_verifier"`
+		Audit struct {
+			ProvidersPerBlock wos.EnvInt    `json:"providers_per_block"`
+			Confirmations     wos.EnvUint64 `json:"confirmations"`
+			Parallelism       wos.EnvInt    `json:"parallelism"`
+			CheckInterval     wos.EnvString `json:"check_interval"`
+			Enabled           bool          `json:"enabled"`
+		} `json:"audit"`
 	}{}
 	if err := json.Unmarshal(d, &x); err != nil {
 		return err
@@ -366,6 +425,21 @@ func (s *Source) UnmarshalJSON(d []byte) error {
 	s.Stop = uint64(x.Stop)
 	s.Concurrency = int(x.Concurrency)
 	s.BatchSize = int(x.BatchSize)
+	s.Consensus.Providers = int(x.Consensus.Providers)
+	s.Consensus.Threshold = int(x.Consensus.Threshold)
+	s.Consensus.MaxAttempts = int(x.Consensus.MaxAttempts)
+	s.ReceiptVerifier.Provider = string(x.ReceiptVerifier.Provider)
+	s.ReceiptVerifier.Enabled = x.ReceiptVerifier.Enabled
+	s.Audit.ProvidersPerBlock = int(x.Audit.ProvidersPerBlock)
+	s.Audit.Confirmations = uint64(x.Audit.Confirmations)
+	s.Audit.Parallelism = int(x.Audit.Parallelism)
+	s.Audit.Enabled = x.Audit.Enabled
+	if s.Consensus.Providers == 0 {
+		s.Consensus.Providers = 1
+	}
+	if s.Consensus.Threshold == 0 {
+		s.Consensus.Threshold = 1
+	}
 
 	var urls []string
 	urls = append(urls, string(x.URL))
@@ -387,6 +461,66 @@ func (s *Source) UnmarshalJSON(d []byte) error {
 		if err != nil {
 			const tag = "unable to parse poll_duration value: %s"
 			return fmt.Errorf(tag, string(x.PollDuration))
+		}
+	}
+
+	s.Consensus.RetryBackoff = 2 * time.Second
+	if len(x.Consensus.RetryBackoff) > 0 {
+		var err error
+		s.Consensus.RetryBackoff, err = time.ParseDuration(string(x.Consensus.RetryBackoff))
+		if err != nil {
+			const tag = "unable to parse retry_backoff value: %s"
+			return fmt.Errorf(tag, string(x.Consensus.RetryBackoff))
+		}
+	}
+
+	s.Consensus.MaxBackoff = 30 * time.Second
+	if len(x.Consensus.MaxBackoff) > 0 {
+		var err error
+		s.Consensus.MaxBackoff, err = time.ParseDuration(string(x.Consensus.MaxBackoff))
+		if err != nil {
+			const tag = "unable to parse max_backoff value: %s"
+			return fmt.Errorf(tag, string(x.Consensus.MaxBackoff))
+		}
+	}
+
+	// Audit defaults and parsing, mirroring the style used for PollDuration
+	// and consensus backoff fields above.
+	s.Audit.CheckInterval = 5 * time.Second
+	if len(x.Audit.CheckInterval) > 0 {
+		var err error
+		s.Audit.CheckInterval, err = time.ParseDuration(string(x.Audit.CheckInterval))
+		if err != nil {
+			const tag = "unable to parse check_interval value: %s"
+			return fmt.Errorf(tag, string(x.Audit.CheckInterval))
+		}
+	}
+
+	if s.Audit.ProvidersPerBlock == 0 {
+		s.Audit.ProvidersPerBlock = 2
+	}
+	if s.Audit.Confirmations == 0 {
+		s.Audit.Confirmations = 128
+	}
+	if s.Audit.Parallelism == 0 {
+		s.Audit.Parallelism = 4
+	}
+
+	if len(s.URLs) > 0 && len(s.URLs) < s.Consensus.Providers {
+		return fmt.Errorf("configured %d consensus providers but only %d URLs provided", s.Consensus.Providers, len(s.URLs))
+	}
+	if s.Consensus.Threshold > s.Consensus.Providers {
+		return fmt.Errorf("consensus threshold (%d) cannot exceed providers (%d)", s.Consensus.Threshold, s.Consensus.Providers)
+	}
+
+	if s.ReceiptVerifier.Enabled {
+		if s.ReceiptVerifier.Provider == "" {
+			return fmt.Errorf("receipt_verifier.provider must be specified when enabled")
+		}
+		for _, u := range s.URLs {
+			if u == s.ReceiptVerifier.Provider {
+				return fmt.Errorf("receipt_verifier.provider must differ from consensus providers")
+			}
 		}
 	}
 

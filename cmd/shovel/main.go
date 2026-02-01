@@ -134,6 +134,15 @@ func main() {
 	pg, err := wpg.NewPool(ctx, pgurl)
 	check(err)
 
+	// Initialize OpenTelemetry tracing
+	tracingCfg := shovel.TracingConfigFromEnv()
+	if tracingCfg.ServiceVersion == "" {
+		tracingCfg.ServiceVersion = Commit
+	}
+	shutdownTracing, err := shovel.InitTracing(ctx, tracingCfg)
+	check(err)
+	defer shutdownTracing(ctx)
+
 	if !skipMigrate {
 		dbtx, err := pg.Begin(ctx)
 		check(err)
@@ -152,7 +161,8 @@ func main() {
 	var (
 		pbuf bytes.Buffer
 		mgr  = shovel.NewManager(ctx, pg, conf)
-		wh   = web.New(mgr, &conf, pg)
+		rs   = shovel.NewRepairService(pg, conf, mgr)
+		wh   = web.New(mgr, &conf, pg, rs)
 	)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", wh.Index)
@@ -164,6 +174,9 @@ func main() {
 	mux.Handle("/save-source", wh.Authn(wh.SaveSource))
 	mux.Handle("/add-integration", wh.Authn(wh.AddIntegration))
 	mux.Handle("/save-integration", wh.Authn(wh.SaveIntegration))
+	mux.Handle("/api/v1/repair", wh.Authn(wh.HandleRepairRequest))
+	mux.Handle("/api/v1/repair/", wh.Authn(wh.HandleRepairStatus))
+	mux.Handle("/api/v1/repairs", wh.Authn(wh.HandleListRepairs))
 	mux.HandleFunc("/debug/pprof/", npprof.Index)
 	mux.HandleFunc("/debug/pprof/cmdline", npprof.Cmdline)
 	mux.HandleFunc("/debug/pprof/profile", npprof.Profile)
